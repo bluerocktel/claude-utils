@@ -1,0 +1,104 @@
+#!/bin/bash
+# claude-task: run a Claude task autonomously in a detached tmux session
+#
+# Usage:
+#   claude-task [task.md]     Launch task (picks oldest from ~/tasks/inbox/ if no arg)
+#   claude-task --run FILE    Internal mode used by tmux (do not call directly)
+
+INBOX=~/tasks/inbox
+RUN_DIR=~/tasks/run
+DONE_DIR=~/tasks/done
+LOG=~/tasks/DONE.md
+
+# ── Internal execution mode ────────────────────────────────────────────────
+if [ "$1" = "--run" ]; then
+    TASK_FILE="$2"
+    TASK_NAME=$(basename "$TASK_FILE" .md)
+    TIMESTAMP=$(date '+%Y-%m-%d_%H-%M')
+    RESULT_FILE="$DONE_DIR/${TIMESTAMP}_${TASK_NAME}.md"
+
+    {
+        echo "# $TASK_NAME"
+        echo ""
+        echo "**Started:** $(date '+%Y-%m-%d %H:%M')"
+        echo ""
+        echo "---"
+        echo ""
+    } > "$RESULT_FILE"
+
+    tail -f "$RESULT_FILE" &
+    TAIL_PID=$!
+
+    PREAMBLE="AUTONOMOUS MODE: You have no user to interact with. Never ask questions, never present options, never wait for confirmation. Make decisions and implement immediately. Document choices in a ## Summary at the end. After the ## Summary, always add a ## Suggested Commit Message section containing a ready-to-use git commit message (subject line + optional body) that accurately describes all changes made. Do not run git commit yourself."
+
+    claude --dangerously-skip-permissions -p "$PREAMBLE
+
+$(cat "$TASK_FILE")" >> "$RESULT_FILE" 2>&1
+    STATUS=$?
+
+    kill $TAIL_PID 2>/dev/null
+    wait $TAIL_PID 2>/dev/null
+
+    {
+        echo ""
+        echo "---"
+        echo ""
+        echo "**Finished:** $(date '+%Y-%m-%d %H:%M')"
+    } >> "$RESULT_FILE"
+
+    # Append to log
+    {
+        echo "## $(date '+%Y-%m-%d %H:%M') - $TASK_NAME"
+        echo ""
+        if [ $STATUS -eq 0 ]; then
+            echo "**Status:** completed"
+        else
+            echo "**Status:** FAILED (exit code $STATUS)"
+        fi
+        echo "**Result:** \`$RESULT_FILE\`"
+        echo ""
+    } >> "$LOG"
+
+    # Move original task file back to inbox without .md extension
+    mv "$TASK_FILE" "$INBOX/$(basename "$TASK_FILE" .md)"
+
+    # Desktop notification
+    if [ $STATUS -eq 0 ]; then
+        notify-send "Claude: Task Done" "$TASK_NAME completed successfully."
+    else
+        notify-send -u critical "Claude: Task Failed" "$TASK_NAME failed. See $RESULT_FILE"
+    fi
+
+    exit $STATUS
+fi
+
+# ── Launcher mode ──────────────────────────────────────────────────────────
+if [ -n "$1" ]; then
+    TASK_FILE="$1"
+else
+    TASK_FILE=$(ls -tr "$INBOX"/*.md 2>/dev/null | head -1)
+fi
+
+if [ -z "$TASK_FILE" ] || [ ! -f "$TASK_FILE" ]; then
+    echo "Usage: claude-task [task.md]"
+    echo "No .md task file found in $INBOX"
+    exit 1
+fi
+
+TASK_NAME=$(basename "$TASK_FILE" .md)
+SESSION="claude-${TASK_NAME}"
+
+if tmux has-session -t "$SESSION" 2>/dev/null; then
+    echo "Session '$SESSION' already running. Attach: tmux attach -t $SESSION"
+    exit 1
+fi
+
+mkdir -p "$RUN_DIR"
+mv "$TASK_FILE" "$RUN_DIR/"
+TASK_FILE="$RUN_DIR/$(basename "$TASK_FILE")"
+
+tmux new-session -d -s "$SESSION" bash -lc "\"$HOME/bin/claude-task\" --run \"$TASK_FILE\""
+
+echo "Task '$TASK_NAME' started in tmux session '$SESSION'."
+echo "Monitor : tmux attach -t $SESSION"
+echo "Result  : $DONE_DIR/*_${TASK_NAME}.md"

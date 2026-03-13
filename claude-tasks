@@ -1,0 +1,23 @@
+#!/bin/bash
+# claude-tasks: launch all tasks in ~/tasks/inbox/ in parallel
+#
+# Usage: claude-tasks
+
+INBOX=~/tasks/inbox
+
+TASKS=("$INBOX"/*.md)
+
+if [ ! -f "${TASKS[0]}" ]; then
+    echo "No .md task files found in $INBOX"
+    exit 1
+fi
+
+COUNT=0
+for TASK_FILE in "${TASKS[@]}"; do
+    "$HOME/bin/claude-task" "$TASK_FILE"
+    COUNT=$((COUNT + 1))
+done
+
+echo ""
+echo "$COUNT task(s) launched in parallel."
+echo "List sessions : tmux ls"

@@ -1,0 +1,41 @@
+#!/bin/bash
+# ltask: list tasks - show inbox and running tasks
+
+INBOX=~/tasks/inbox
+RUN_DIR=~/tasks/run
+
+inbox_files=("$INBOX"/*.md)
+run_files=("$RUN_DIR"/*.md)
+
+# Count inbox
+if [ -f "${inbox_files[0]}" ]; then
+    inbox_count=${#inbox_files[@]}
+else
+    inbox_count=0
+fi
+
+# Count running
+if [ -f "${run_files[0]}" ]; then
+    run_count=${#run_files[@]}
+else
+    run_count=0
+fi
+
+echo "Inbox ($inbox_count):"
+if [ "$inbox_count" -eq 0 ]; then
+    echo "  (empty)"
+else
+    for f in "${inbox_files[@]}"; do
+        echo "  - $(basename "$f" .md)"
+    done
+fi
+
+echo ""
+echo "Running ($run_count):"
+if [ "$run_count" -eq 0 ]; then
+    echo "  (empty)"
+else
+    for f in "${run_files[@]}"; do
+        echo "  - $(basename "$f" .md)"
+    done
+fi

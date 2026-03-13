@@ -1,0 +1,47 @@
+#!/bin/bash
+# init: set up the ~/tasks/ directory structure for claude-utils
+
+TASKS_DIR=~/tasks
+
+echo "Initializing $TASKS_DIR ..."
+
+mkdir -p "$TASKS_DIR/inbox" "$TASKS_DIR/run" "$TASKS_DIR/done"
+
+SAMPLE="$TASKS_DIR/inbox/sample-task.md"
+if [ ! -f "$SAMPLE" ]; then
+    cat > "$SAMPLE" <<'EOF'
+# Sample Task
+
+## Context
+
+Working directory: ~/
+
+Brief description of what this task is about and why it needs to be done.
+
+## Tasks
+
+### Task 1: first step
+
+Describe what Claude should do here.
+
+### Task 2: second step
+
+Describe the next step, referencing any relevant files or paths.
+
+## Expected outcome
+
+Describe what a successful result looks like.
+EOF
+    echo "Created sample task: $SAMPLE"
+else
+    echo "Sample task already exists, skipping."
+fi
+
+echo ""
+echo "Done. Task directories ready:"
+echo "  $TASKS_DIR/inbox/"
+echo "  $TASKS_DIR/run/"
+echo "  $TASKS_DIR/done/"
+echo ""
+echo "To run tasks automatically, add this to your crontab (crontab -e):"
+echo "  */15 * * * * $HOME/bin/claude-task >> $TASKS_DIR/cron.log 2>&1"

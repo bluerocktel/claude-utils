@@ -1,0 +1,31 @@
+#!/bin/bash
+# mtask: email last (or Nth-to-last) task from ~/tasks/done/
+# Usage: mtask [N]  (default: 1 = most recent)
+
+DONE_DIR=~/tasks/done
+CONFIG_FILE="$(dirname "$(realpath "$0")")/config"
+N=${1:-1}
+
+if [ ! -f "$CONFIG_FILE" ]; then
+    echo "Config file not found: $CONFIG_FILE"
+    exit 1
+fi
+
+# shellcheck source=/dev/null
+source "$CONFIG_FILE"
+
+if [ -z "${email:-}" ]; then
+    echo "No email defined in $CONFIG_FILE"
+    exit 1
+fi
+
+file=$(ls "$DONE_DIR" | sort | tail -"$N" | head -1)
+
+if [ -z "$file" ]; then
+    echo "No tasks found in $DONE_DIR"
+    exit 1
+fi
+
+subject=$(basename "$file" .md)
+mail -s "$subject" "$email" < "$DONE_DIR/$file"
+echo "Sent: $subject"

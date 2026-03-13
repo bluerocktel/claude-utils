@@ -1,0 +1,15 @@
+#!/bin/bash
+# vtask: open last (or Nth-to-last) task from ~/tasks/done/ in vim
+# Usage: vtask [N]  (default: 1 = most recent)
+
+DONE_DIR=~/tasks/done
+N=${1:-1}
+
+file=$(ls "$DONE_DIR" | sort | tail -"$N" | head -1)
+
+if [ -z "$file" ]; then
+    echo "No tasks found in $DONE_DIR"
+    exit 1
+fi
+
+exec vim "$DONE_DIR/$file"
