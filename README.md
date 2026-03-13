@@ -126,6 +126,13 @@ Tasks are plain Markdown files. See `~/tasks/inbox/sample-task.md` for a templat
 
 Claude runs fully autonomously: no questions, no prompts. Be explicit.
 
+## Task output format
+
+Each result file in `~/tasks/done/` ends with two standard sections appended by Claude:
+
+- **`## Summary`**: what was done, key decisions made, and any follow-up actions to be aware of.
+- **`## Suggested Commit Message`**: a ready-to-use git commit message (subject line + optional body) describing all changes made. Claude does not run `git commit` itself.
+
 ## License
 
 MIT
