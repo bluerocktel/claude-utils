@@ -21,7 +21,7 @@ cd ~/Scripts/claude-utils
 cp config.example config
 # Edit config with your own values
 chmod +x ~/Scripts/claude-utils/*
-for script in claude-task claude-tasks ltask vtask mtask; do
+for script in claude-task claude-tasks claude-plan claude-plans ltask vtask mtask; do
   ln -s ~/Scripts/claude-utils/$script ~/bin/$script
 done
 ln -s ~/Scripts/claude-utils/init ~/bin/claude-init
@@ -40,10 +40,27 @@ claude-init
 
 ### `claude-init`
 
-Creates `~/tasks/{inbox,run,done}/` and drops a `sample-task.md` in inbox. Run once per machine.
+Creates `~/tasks/{plan,planned,inbox,run,done}/` and drops a `sample-task.md` in inbox. Run once per machine.
 
 ```
 claude-init
+```
+
+### `claude-plan`
+
+Generates an implementation plan for a task in `~/tasks/plan/`. Runs Claude in planning mode (no code written, no files edited) and writes a structured, ready-to-execute Markdown file to `~/tasks/planned/`. Review and edit the plan there, then move it to `~/tasks/inbox/` to execute with `claude-task`.
+
+```
+claude-plan                  # picks oldest task from ~/tasks/plan/
+claude-plan path/to/task.md  # plan a specific file
+```
+
+### `claude-plans`
+
+Launches planning for all `.md` files in `~/tasks/plan/` in parallel, each in its own tmux session.
+
+```
+claude-plans
 ```
 
 ### `claude-task`
@@ -65,7 +82,7 @@ claude-tasks
 
 ### `ltask`
 
-Lists tasks currently in `~/tasks/inbox/` and `~/tasks/run/`.
+Lists tasks in `~/tasks/plan/`, `~/tasks/planned/`, `~/tasks/inbox/`, and `~/tasks/run/`.
 
 ```
 ltask
@@ -93,12 +110,26 @@ mtask 2    # second-to-last
 
 ```
 ~/tasks/
-  inbox/    # .md files waiting to be picked up
+  projects/ # project context files (one per project, see "Project context" section)
+  plan/     # rough task descriptions waiting for a planning pass
+  planned/  # Claude-generated plans awaiting review (move to inbox/ to execute)
+  inbox/    # .md files ready to run
   run/      # tasks currently executing
   done/     # completed result files (timestamped)
   DONE.md   # running log of all completed/failed tasks
   cron.log  # cron output (if using crontab automation)
 ```
+
+### Planning workflow
+
+For complex tasks, use the two-phase flow:
+
+1. Write a rough description and drop it in `~/tasks/plan/`
+2. Run `claude-plan` — Claude analyzes and outputs a structured plan to `~/tasks/planned/`
+3. Review and optionally edit the plan file in `planned/`
+4. Move it to `~/tasks/inbox/` and run `claude-task` as normal
+
+For simple tasks, skip planning and drop directly into `~/tasks/inbox/`.
 
 ## Crontab automation
 
@@ -116,12 +147,68 @@ Recommended entry (every 15 minutes):
 
 `claude-task` exits silently with no error when the inbox is empty, so frequent polling is safe.
 
+## Project context
+
+Instead of repeating working directory, URLs, and stack details in every task, define them once in a project file under `~/tasks/projects/`.
+
+### Project file format
+
+```markdown
+## Type
+code  # or: writing
+
+## Aliases
+- `myproject`
+
+## Working Directory
+`~/Projects/myproject/`
+
+## CLAUDE.md
+`~/Projects/myproject/CLAUDE.md`
+
+## Local URL
+`https://myproject.test`
+```
+
+The `## Type` field controls which conventions Claude applies:
+- `code`: coding rules apply (implementation plan, careful file editing, etc.)
+- `writing`: text rules apply (prose quality, no code conventions)
+
+### Linking a task to a project
+
+Add a `## Project` section at the top of your task file with the project alias:
+
+```markdown
+## Project
+myproject
+
+## Instructions
+
+Your task here.
+```
+
+Claude will read `~/tasks/projects/myproject.md` automatically before starting work.
+
+### Task folder layout (full)
+
+```
+~/tasks/
+  projects/   # project context files (one per project)
+  plan/       # rough task descriptions waiting for a planning pass
+  planned/    # Claude-generated plans awaiting review
+  inbox/      # .md files ready to run
+  run/        # tasks currently executing
+  done/       # completed result files (timestamped)
+  DONE.md     # running log of all completed/failed tasks
+  cron.log    # cron output (if using crontab automation)
+```
+
 ## Writing a task
 
 Tasks are plain Markdown files. See `~/tasks/inbox/sample-task.md` for a template. A good task includes:
 
-- **Context**: working directory, relevant files, background
-- **Tasks**: numbered steps with clear expected actions
+- **Project**: alias referencing `~/tasks/projects/{name}.md` (replaces manual context)
+- **Instructions**: numbered steps with clear expected actions
 - **Expected outcome**: what success looks like
 
 Claude runs fully autonomously: no questions, no prompts. Be explicit.
