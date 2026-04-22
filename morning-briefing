@@ -1,0 +1,170 @@
+#!/bin/bash
+# morning-briefing: daily task activity report written to ~/Notes/briefing-YYYY-MM-DD.md
+
+TASKS="$HOME/tasks"
+DONE="$TASKS/done"
+INBOX="$TASKS/inbox"
+BACKLOG="$TASKS/backlog"
+NOTES="$HOME/Notes"
+TODAY=$(date +%Y-%m-%d)
+OUTPUT="$NOTES/briefing-$TODAY.md"
+
+PRINT=0
+for arg in "$@"; do
+    [ "$arg" = "--print" ] && PRINT=1
+done
+
+mkdir -p "$NOTES"
+
+# Read ## Project field from a task file (same pattern as dtask)
+_get_project() {
+    local file="$1"
+    awk '/^## Project/{found=1; next} found && /^[^#[:space:]]/{print; exit} found && /^[[:space:]]*$/{next} found && /^##/{exit}' "$file" 2>/dev/null | tr -d '[:space:]'
+}
+
+# Extract first non-empty, non-heading line after ## Summary
+_get_summary() {
+    local file="$1"
+    awk '/^## Summary/{found=1; next} found && /^[[:space:]]*$/{next} found && /^#/{next} found && /[^[:space:]]/{print; exit}' "$file" 2>/dev/null
+}
+
+# Human-readable age from seconds diff
+_human_age() {
+    local diff="$1"
+    local minutes=$(( diff / 60 ))
+    local hours=$(( diff / 3600 ))
+    if [ "$minutes" -lt 60 ]; then
+        echo "${minutes}m"
+    elif [ "$hours" -lt 48 ]; then
+        echo "${hours}h"
+    else
+        echo "$(( diff / 86400 ))d"
+    fi
+}
+
+now=$(date +%s)
+
+# Collect recent done files: last 24h, sorted oldest-first by name (date prefix sorts chronologically)
+mapfile -t done_files < <(
+    find "$DONE" -maxdepth 1 -name "*.md" -not -name "*.task.md" -mmin -1440 2>/dev/null | sort
+)
+
+tmp=$(mktemp)
+
+# ── Header ────────────────────────────────────────────────────────
+echo "# Morning Briefing — $TODAY" >> "$tmp"
+
+# ── Section 1: Tasks Completed ────────────────────────────────────
+echo "" >> "$tmp"
+echo "## Tasks Completed (last 24 h)" >> "$tmp"
+
+if [ ${#done_files[@]} -eq 0 ]; then
+    echo "- (none in the last 24 h)" >> "$tmp"
+else
+    for f in "${done_files[@]}"; do
+        base=$(basename "$f" .md)
+        companion="${DONE}/${base}.task.md"
+        proj=""
+        if [ -f "$companion" ]; then
+            proj=$(_get_project "$companion")
+        fi
+        [ -z "$proj" ] && proj="other"
+        display=$(echo "$base" | sed 's/^[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}_[0-9]\{2\}-[0-9]\{2\}_//')
+        summary=$(_get_summary "$f")
+        echo "- [${proj}] ${display} — ${summary}" >> "$tmp"
+    done
+fi
+
+# ── Section 2: Inbox Queue ────────────────────────────────────────
+echo "" >> "$tmp"
+echo "## Inbox Queue" >> "$tmp"
+
+mapfile -t inbox_files < <(
+    find "$INBOX" -maxdepth 1 -name "*.md" -printf "%T@ %p\n" 2>/dev/null | sort -n | cut -d' ' -f2-
+)
+
+if [ ${#inbox_files[@]} -eq 0 ]; then
+    echo "- (empty)" >> "$tmp"
+else
+    for f in "${inbox_files[@]}"; do
+        [ -f "$f" ] || continue
+        base=$(basename "$f" .md)
+        display=$(echo "$base" | sed 's/^[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}_[0-9]\{2\}-[0-9]\{2\}_//')
+        mtime=$(stat -c %Y "$f" 2>/dev/null || echo "$now")
+        age=$(_human_age $(( now - mtime )))
+        echo "- ${display} (${age})" >> "$tmp"
+    done
+fi
+
+# ── Section 3: Backlog Snapshot ───────────────────────────────────
+echo "" >> "$tmp"
+echo "## Backlog Snapshot" >> "$tmp"
+
+mapfile -t backlog_files < <(
+    find "$BACKLOG" -maxdepth 1 -name "*.md" -printf "%T@ %p\n" 2>/dev/null | sort -n | cut -d' ' -f2-
+)
+
+if [ ${#backlog_files[@]} -eq 0 ]; then
+    echo "- (empty)" >> "$tmp"
+else
+    for f in "${backlog_files[@]}"; do
+        [ -f "$f" ] || continue
+        base=$(basename "$f" .md)
+        display=$(echo "$base" | sed 's/^[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}_[0-9]\{2\}-[0-9]\{2\}_//')
+        mtime=$(stat -c %Y "$f" 2>/dev/null || echo "$now")
+        diff=$(( now - mtime ))
+        days=$(( diff / 86400 ))
+        if [ "$diff" -lt 86400 ]; then
+            age="<1d"
+        else
+            age="${days}d"
+        fi
+        prefix=""
+        [ "$days" -gt 14 ] && prefix="⚠ "
+        echo "- ${prefix}${display} (${age})" >> "$tmp"
+    done
+fi
+
+# ── Section 4: Yesterday's Spend ─────────────────────────────────
+echo "" >> "$tmp"
+echo "## Yesterday's Spend" >> "$tmp"
+
+# Build "project cost" pairs for awk aggregation
+cost_input=""
+for f in "${done_files[@]}"; do
+    base=$(basename "$f" .md)
+    companion="${DONE}/${base}.task.md"
+    proj=""
+    if [ -f "$companion" ]; then
+        proj=$(_get_project "$companion")
+    fi
+    [ -z "$proj" ] && proj="other"
+    cost=$(grep '^\*\*Total cost:\*\* \$' "$f" 2>/dev/null | head -1 | sed 's/^\*\*Total cost:\*\* \$//')
+    [ -z "$cost" ] && cost="0"
+    cost_input+="${proj} ${cost}"$'\n'
+done
+
+printf "%s" "$cost_input" | awk '
+    NF == 2 {
+        proj[$1] += $2
+        total += $2
+    }
+    END {
+        print "| Project | Cost |"
+        print "|---------|------|"
+        if (length(proj) == 0) {
+            printf "| **Total** | **$%.4f** |\n", 0
+        } else {
+            n = asorti(proj, sorted)
+            for (i = 1; i <= n; i++) {
+                printf "| %s | $%.4f |\n", sorted[i], proj[sorted[i]]
+            }
+            printf "| **Total** | **$%.4f** |\n", total
+        }
+    }
+' >> "$tmp"
+
+# ── Atomic write ──────────────────────────────────────────────────
+mv "$tmp" "$OUTPUT"
+
+[ "$PRINT" -eq 1 ] && cat "$OUTPUT"
