@@ -6,20 +6,22 @@ See README.md for full project documentation, script descriptions, and setup ins
 
 ### What this repo is
 
-Shell scripts that drive autonomous Claude Code task execution. The core loop:
-`claude-task` moves a `.md` file from `inbox/` to `run/`, calls `claude --dangerously-skip-permissions -p`, writes output to `done/`, then notifies the user.
+Shell scripts that drive autonomous Claude Code task execution. The full flow:
+`backlog/` → `claude-prep` → `backlog-for-review/` → (user review) → `inbox/` or `plan/` → `claude-task`/`claude-plan` → `done/`/`plan-for-review/`.
 
 ### Conventions
 
 - All scripts: `#!/bin/bash`, no external dependencies beyond what README lists.
-- Scripts must be safe to run with an empty inbox (exit 0, print nothing or a short message).
+- Scripts must be safe to run with an empty source folder (exit 0, print nothing or a short message).
 - `config` is sourced as key=value. Never hardcode user-specific values (email, paths beyond `$HOME`).
 - Symlink names in `~/bin/` matter: `init` is exposed as `claude-init` to avoid clashing with system commands.
 
 ### What to watch out for
 
-- `claude-task` calls itself via `$HOME/bin/claude-task --run` for the internal tmux execution. If you rename the script, update that self-reference on line 100.
+- `claude-task` calls itself via `$HOME/bin/claude-task --run` for the internal tmux execution. If you rename the script, update that self-reference.
 - `claude-tasks` also references `$HOME/bin/claude-task` directly. Keep both in sync if the name changes.
+- `claude-prep` and `claude-plan` use the same self-call pattern (`$HOME/bin/claude-prep --run`, `$HOME/bin/claude-plan --run`). Keep symlink names in sync.
+- `claude-preps` and `claude-plans` reference their respective single-task scripts via `$HOME/bin/`.
 - `mtask` sources `config` at runtime via `realpath "$0"`, so it works correctly through the symlink.
 
 ### Adding a script

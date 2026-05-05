@@ -1,0 +1,138 @@
+#!/bin/bash
+# claude-eval: evaluate a completed task against its acceptance criteria
+#
+# Usage:
+#   claude-eval TASK_FILE RESULT_FILE [OUTPUT_FILE]
+#
+# Exit codes:
+#   0 = PASS
+#   1 = FAIL
+#   2 = no ## Acceptance Criteria section found (skip evaluation)
+#
+# If OUTPUT_FILE is given, evaluator response is written there.
+# Otherwise it is printed to stdout.
+
+TASK_FILE="$1"
+RESULT_FILE="$2"
+OUTPUT_FILE="$3"
+
+if [ -z "$TASK_FILE" ] || [ -z "$RESULT_FILE" ]; then
+    echo "Usage: claude-eval TASK_FILE RESULT_FILE [OUTPUT_FILE]" >&2
+    exit 2
+fi
+
+if [ ! -f "$TASK_FILE" ]; then
+    echo "claude-eval: task file not found: $TASK_FILE" >&2
+    exit 2
+fi
+
+if [ ! -f "$RESULT_FILE" ]; then
+    echo "claude-eval: result file not found: $RESULT_FILE" >&2
+    exit 2
+fi
+
+# ── Test Command ───────────────────────────────────────────────────────────
+# Run commands under ## Test Command before calling the LLM evaluator.
+# A non-zero exit from any command short-circuits to FAIL immediately.
+TEST_PASSED=0
+if grep -q "^## Test Command" "$TASK_FILE"; then
+    TEST_TMP=$(mktemp)
+    TEST_EXIT=0
+    TEST_RAN=0
+    TEST_FAILED_CMD=""
+
+    while IFS= read -r cmd; do
+        [ -z "${cmd// }" ] && continue
+        TEST_RAN=1
+        bash -c "$cmd" >> "$TEST_TMP" 2>&1
+        CMD_EXIT=$?
+        if [ $CMD_EXIT -ne 0 ]; then
+            TEST_EXIT=$CMD_EXIT
+            TEST_FAILED_CMD="$cmd"
+            break
+        fi
+    done < <(awk '/^## Test Command/{found=1; next} found && /^## /{exit} found{print}' "$TASK_FILE")
+
+    if [ $TEST_EXIT -ne 0 ]; then
+        FAIL_MSG=$(printf '## Test Results\n\nCommand failed (exit %s):\n```\n%s\n```\n\nOutput:\n```\n%s\n```\n\nVERDICT: FAIL' \
+            "$TEST_EXIT" "$TEST_FAILED_CMD" "$(cat "$TEST_TMP")")
+        if [ -n "$OUTPUT_FILE" ]; then
+            printf '%s\n' "$FAIL_MSG" > "$OUTPUT_FILE"
+        else
+            printf '%s\n' "$FAIL_MSG"
+        fi
+        rm -f "$TEST_TMP"
+        exit 1
+    fi
+    rm -f "$TEST_TMP"
+    [ $TEST_RAN -eq 1 ] && TEST_PASSED=1
+fi
+
+# Exit early if no acceptance criteria
+if ! grep -q "^## Acceptance Criteria" "$TASK_FILE"; then
+    # If tests ran and passed, that counts as PASS; otherwise skip evaluation
+    exit $((TEST_PASSED == 1 ? 0 : 2))
+fi
+
+# Resolve model from task frontmatter (## Model field), same logic as claude-task
+MODEL_FLAG=""
+RAW_MODEL=$(awk '/^## Model/{found=1; next} found && /^[^#]/{print; exit}' "$TASK_FILE" | tr -d '[:space:]')
+case "$RAW_MODEL" in
+    opus)   MODEL_FLAG="--model claude-opus-4-6" ;;
+    sonnet) MODEL_FLAG="--model claude-sonnet-4-6" ;;
+    haiku)  MODEL_FLAG="--model claude-haiku-4-5-20251001" ;;
+    "")     MODEL_FLAG="" ;;
+    *)      MODEL_FLAG="--model $RAW_MODEL" ;;
+esac
+
+PROMPT_TMP=$(mktemp)
+JSON_TMP=$(mktemp)
+
+{
+    cat <<'PREAMBLE'
+You are a skeptical evaluator reviewing the output of an autonomous agent. Assess whether the task was completed correctly against its acceptance criteria.
+
+Rules:
+- Be critical. Do not give the benefit of the doubt.
+- If a criterion cannot be verified from the result, mark it FAIL.
+- Do not praise — only report problems.
+
+Output format:
+1. Grade each acceptance criterion as: "- [PASS/FAIL] criterion: one-line reason"
+2. A "## Issues" section listing specific problems to fix (omit section entirely if all PASS).
+3. End your response with exactly one of these two lines:
+   VERDICT: PASS
+   VERDICT: FAIL
+
+---
+## TASK
+
+PREAMBLE
+    cat "$TASK_FILE"
+    printf "\n---\n## RESULT\n\n"
+    cat "$RESULT_FILE"
+} > "$PROMPT_TMP"
+
+claude --dangerously-skip-permissions $MODEL_FLAG \
+    -p "$(cat "$PROMPT_TMP")" \
+    --output-format json > "$JSON_TMP" 2>&1
+CLAUDE_STATUS=$?
+
+EVAL_TEXT=$(jq -r '.result // ""' "$JSON_TMP" 2>/dev/null)
+rm -f "$PROMPT_TMP" "$JSON_TMP"
+
+if [ -n "$OUTPUT_FILE" ]; then
+    printf '%s\n' "$EVAL_TEXT" > "$OUTPUT_FILE"
+else
+    printf '%s\n' "$EVAL_TEXT"
+fi
+
+if [ $CLAUDE_STATUS -ne 0 ]; then
+    exit 1
+fi
+
+if printf '%s\n' "$EVAL_TEXT" | grep -q "^VERDICT: PASS$"; then
+    exit 0
+else
+    exit 1
+fi

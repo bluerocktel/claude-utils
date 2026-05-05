@@ -7,7 +7,7 @@
 
 PLAN_DIR=~/tasks/plan
 RUN_DIR=~/tasks/run
-PLANNED_DIR=~/tasks/planned
+PLANNED_DIR=~/tasks/plan-for-review
 
 # ── Internal execution mode ────────────────────────────────────────────────
 if [ "$1" = "--run" ]; then
@@ -39,7 +39,7 @@ $(cat "$TASK_FILE")" > "$RESULT_FILE" 2>&1
     mv "$TASK_FILE" "$PLAN_DIR/$(basename "$TASK_FILE" .md)"
 
     if [ $STATUS -eq 0 ]; then
-        notify-send "Claude: Plan Ready" "$TASK_NAME. Review in ~/tasks/planned/"
+        notify-send "Claude: Plan Ready" "$TASK_NAME. Review in ~/tasks/plan-for-review/"
     else
         notify-send -u critical "Claude: Plan Failed" "$TASK_NAME planning failed. See $RESULT_FILE"
     fi

@@ -312,6 +312,29 @@ If your task file contains an `## Acceptance Criteria` section, `claude-eval` ru
 
 The retry limit defaults to 3 and can be changed by setting `max_retries=N` in your `config` file. Tasks that exhaust all retries are moved to `~/tasks/review/` and appear in `ltask` output for manual inspection.
 
+### Task dependencies
+
+Add a `## Depends-on` section to declare that a task must not run until another task has completed successfully. When `claude-task` picks the next task from `inbox/`, it skips any task whose dependency is not yet in `done/` and picks the next unblocked one instead. This keeps tasks within the same project sequential without preventing tasks from other projects from running in parallel.
+
+```markdown
+## Depends-on
+002-seed-database
+```
+
+The value is a task filename without the timestamp prefix or `.md` extension (match the base name you gave the task when you created it). If all tasks in `inbox/` are blocked, `claude-task` exits with a clear message rather than silently doing nothing.
+
+### Test Command
+
+Add a `## Test Command` section to run real shell commands before the LLM evaluator. Each non-blank line is executed in sequence. The first command that exits non-zero immediately fails the task (VERDICT: FAIL) without calling the LLM, saving API cost and giving a precise failure signal.
+
+```markdown
+## Test Command
+cd ~/Projects/myproject && php artisan test --filter=MyFeatureTest
+cd ~/Projects/myproject && npm run lint
+```
+
+If the task has a `## Test Command` but no `## Acceptance Criteria`, a passing test is enough to mark the task PASS. Commands have access to the full shell environment.
+
 ## Task output format
 
 Each result file in `~/tasks/done/` ends with two standard sections appended by Claude:

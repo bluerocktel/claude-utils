@@ -1,0 +1,23 @@
+#!/bin/bash
+# claude-preps: prepare all backlog tasks in parallel
+#
+# Usage: claude-preps
+
+BACKLOG_DIR=~/tasks/backlog
+
+TASKS=("$BACKLOG_DIR"/*.md)
+
+if [ ! -f "${TASKS[0]}" ]; then
+    echo "No .md task files found in $BACKLOG_DIR"
+    exit 1
+fi
+
+COUNT=0
+for TASK_FILE in "${TASKS[@]}"; do
+    "$HOME/bin/claude-prep" "$TASK_FILE"
+    COUNT=$((COUNT + 1))
+done
+
+echo ""
+echo "$COUNT preparation task(s) launched in parallel."
+echo "List sessions : tmux ls"

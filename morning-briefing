@@ -167,4 +167,5 @@ printf "%s" "$cost_input" | awk '
 # ── Atomic write ──────────────────────────────────────────────────
 mv "$tmp" "$OUTPUT"
 
-[ "$PRINT" -eq 1 ] && cat "$OUTPUT"
+if [ "$PRINT" -eq 1 ]; then cat "$OUTPUT"; fi
+exit 0

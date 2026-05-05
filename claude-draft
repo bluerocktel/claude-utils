@@ -1,0 +1,86 @@
+#!/bin/bash
+# claude-draft: split a brain dump into individual backlog task files
+#
+# Usage:
+#   claude-draft [draft.md]     Process draft (picks oldest from ~/tasks/drafts/ if no arg)
+#   claude-draft --run FILE     Internal mode used by tmux (do not call directly)
+
+DRAFTS_DIR=~/tasks/drafts
+BACKLOG_DIR=~/tasks/backlog
+RUN_DIR=~/tasks/run
+
+# ── Internal execution mode ────────────────────────────────────────────────
+if [ "$1" = "--run" ]; then
+    DRAFT_FILE="$2"
+    DRAFT_NAME=$(basename "$DRAFT_FILE" .md)
+
+    PREAMBLE="DRAFT SPLITTING MODE: You are reading a brain dump and splitting it into individual task files for autonomous execution. Do not write code, edit project files, or run shell commands beyond listing ~/tasks/projects/.
+
+Your job:
+1. Read ~/tasks/projects/ to discover available project aliases.
+2. Read the brain dump below.
+3. Identify each distinct task or unit of work. Group related sub-items into one task when they clearly belong together; split when they are independent and could be reviewed or rolled back separately.
+4. For each task, write a minimal Markdown file to ~/tasks/backlog/ using this naming convention: {project-alias}-{brief-slug}.md (e.g. checkindog-fix-login-redirect.md). If no project is identifiable, omit the prefix and use just the slug.
+5. Each file must contain only:
+
+## Project
+{alias — only if clearly identifiable from the brain dump, otherwise omit this section entirely}
+
+## Instructions
+
+{2-5 sentences describing what needs to be done. Keep it brief — claude-prep will add structure and acceptance criteria later. Be specific enough that intent is clear.}
+
+6. After writing all files, print a summary listing the files created, one per line.
+
+Do not add acceptance criteria, numbered steps, or expected outcomes — that is claude-prep's job. Do not invent tasks that are not in the brain dump. Do not merge unrelated tasks to reduce file count.
+
+Brain dump follows:
+
+$(cat "$DRAFT_FILE")"
+
+    claude --dangerously-skip-permissions -p "$PREAMBLE" 2>&1
+    STATUS=$?
+
+    if [ $STATUS -eq 0 ]; then
+        # Archive draft (remove .md so it won't be picked up again)
+        mv "$DRAFT_FILE" "$DRAFTS_DIR/$(basename "$DRAFT_FILE" .md)"
+        notify-send "Claude: Draft Processed" "$DRAFT_NAME split into backlog tasks. Run claude-preps to prepare them."
+    else
+        notify-send -u critical "Claude: Draft Failed" "$DRAFT_NAME could not be processed."
+        mv "$DRAFT_FILE" "$DRAFTS_DIR/$(basename "$DRAFT_FILE")"
+        exit 1
+    fi
+
+    exit $STATUS
+fi
+
+# ── Launcher mode ──────────────────────────────────────────────────────────
+if [ -n "$1" ]; then
+    DRAFT_FILE="$1"
+else
+    DRAFT_FILE=$(ls -tr "$DRAFTS_DIR"/*.md 2>/dev/null | head -1)
+fi
+
+if [ -z "$DRAFT_FILE" ] || [ ! -f "$DRAFT_FILE" ]; then
+    echo "Usage: claude-draft [draft.md]"
+    echo "No .md draft file found in $DRAFTS_DIR"
+    exit 1
+fi
+
+DRAFT_NAME=$(basename "$DRAFT_FILE" .md)
+SESSION="claude-draft-${DRAFT_NAME}"
+
+if tmux has-session -t "$SESSION" 2>/dev/null; then
+    echo "Session '$SESSION' already running. Attach: tmux attach -t $SESSION"
+    exit 1
+fi
+
+mkdir -p "$RUN_DIR"
+mv "$DRAFT_FILE" "$RUN_DIR/"
+DRAFT_FILE="$RUN_DIR/$(basename "$DRAFT_FILE")"
+
+tmux new-session -d -s "$SESSION" bash -lc "\"$HOME/bin/claude-draft\" --run \"$DRAFT_FILE\""
+
+echo "Processing '$DRAFT_NAME' in tmux session '$SESSION'."
+echo "Monitor : tmux attach -t $SESSION"
+echo "Output  : $BACKLOG_DIR/"

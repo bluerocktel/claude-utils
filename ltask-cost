@@ -1,0 +1,170 @@
+#!/bin/bash
+# ltask-cost: aggregate token spend from done tasks and write a weekly + all-time report
+
+DONE_DIR=~/tasks/done
+NOTES_DIR=~/Notes
+
+# Current ISO week
+CURRENT_WEEK=$(date +"%G-W%V")
+_DOW=$(date +%u)
+WEEK_MON=$(date -d "-$((_DOW - 1)) days" +%Y-%m-%d)
+WEEK_SUN=$(date -d "+$((7 - _DOW)) days" +%Y-%m-%d)
+GEN_TIME=$(date '+%Y-%m-%d %H:%M')
+
+OUTPUT_FILE="$NOTES_DIR/claude-task-spend-${CURRENT_WEEK}.md"
+
+mkdir -p "$NOTES_DIR"
+
+# Collect valid done files (exclude *.task.md)
+mapfile -t FILES < <(
+    for f in "$DONE_DIR"/*.md; do
+        [[ -f "$f" ]] || continue
+        [[ "$f" == *.task.md ]] && continue
+        echo "$f"
+    done | sort
+)
+
+TOTAL_SCANNED=${#FILES[@]}
+
+# Single awk pass: parse all files, aggregate spend, generate markdown report
+awk \
+    -v week_mon="$WEEK_MON" \
+    -v week_sun="$WEEK_SUN" \
+    -v current_week="$CURRENT_WEEK" \
+    -v total_scanned="$TOTAL_SCANNED" \
+    -v gen_time="$GEN_TIME" \
+'
+FNR == 1 {
+    filename = FILENAME
+    n = split(filename, parts, "/")
+    bname = parts[n]
+    sub(/\.md$/, "", bname)
+    task_date = substr(bname, 1, 10)
+    slug = substr(bname, 18)
+    # Strip inner datetime prefix present in eval-retry result files
+    # Full datetime prefix: YYYY-MM-DD_HH-MM_ (17 chars)
+    if (slug ~ /^[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}-[0-9]{2}_/)
+        slug = substr(slug, 18)
+    # Date-only prefix: YYYY-MM-DD_ (11 chars)
+    else if (slug ~ /^[0-9]{4}-[0-9]{2}-[0-9]{2}_/)
+        slug = substr(slug, 12)
+    if (index(slug, "-") > 0)
+        project = substr(slug, 1, index(slug, "-") - 1)
+    else
+        project = slug
+    task_id = bname
+    in_week = (task_date >= week_mon && task_date <= week_sun) ? 1 : 0
+    in_section = 0
+}
+
+/^## Token Usage/ { in_section = 1; next }
+/^## /            { in_section = 0 }
+
+in_section && /^\|[^-]/ {
+    ncols = split($0, f, "|")
+    if (ncols < 7) next
+    model = f[2]; cost = f[7]
+    gsub(/^[[:space:]]+|[[:space:]]+$/, "", model)
+    gsub(/^[[:space:]]+|[[:space:]]+$/, "", cost)
+    if (model == "Model" || model == "") next
+    gsub(/^\$/, "", cost)
+    if (cost + 0 <= 0) next
+
+    if (!(task_id in a_task_seen)) {
+        a_task_seen[task_id] = 1
+        a_proj_tasks[project]++
+    }
+    a_proj_cost[project] += cost + 0
+    a_model_cost[model]  += cost + 0
+
+    if (in_week) {
+        if (!(task_id in w_task_seen)) {
+            w_task_seen[task_id] = 1
+            w_proj_tasks[project]++
+        }
+        w_proj_cost[project] += cost + 0
+        w_model_cost[model]  += cost + 0
+    }
+}
+
+function fmt(v) {
+    return sprintf("$%.4f", v)
+}
+
+function sort_by_cost_desc(keys, costs,    n, i, j, tmp, k) {
+    n = 0
+    for (k in costs) keys[n++] = k
+    for (i = 0; i < n - 1; i++)
+        for (j = i + 1; j < n; j++)
+            if (costs[keys[j]] > costs[keys[i]]) {
+                tmp = keys[i]; keys[i] = keys[j]; keys[j] = tmp
+            }
+    return n
+}
+
+function print_proj_table(tasks_arr, cost_arr,    keys, n, i, k, tt, tc) {
+    n = sort_by_cost_desc(keys, cost_arr)
+    tt = 0; tc = 0
+    for (i = 0; i < n; i++) {
+        k = keys[i]
+        printf "| %s | %d | %s |\n", k, tasks_arr[k], fmt(cost_arr[k])
+        tt += tasks_arr[k]
+        tc += cost_arr[k]
+    }
+    printf "| **Total** | **%d** | **%s** |\n", tt, fmt(tc)
+}
+
+function print_model_table(cost_arr,    keys, n, i, k, tc) {
+    n = sort_by_cost_desc(keys, cost_arr)
+    tc = 0
+    for (i = 0; i < n; i++) {
+        k = keys[i]
+        printf "| %s | %s |\n", k, fmt(cost_arr[k])
+        tc += cost_arr[k]
+    }
+    printf "| **Total** | **%s** |\n", fmt(tc)
+}
+
+END {
+    print "# Claude Task Spend Report"
+    print ""
+    printf "**Generated:** %s\n", gen_time
+    printf "**Week:** %s (%s to %s)\n", current_week, week_mon, week_sun
+    printf "**Done tasks scanned:** %d\n", total_scanned
+    print ""
+    print "---"
+    print ""
+    print "## This Week"
+    print ""
+    print "### By Project"
+    print ""
+    print "| Project | Tasks | Cost |"
+    print "|---------|-------|------|"
+    print_proj_table(w_proj_tasks, w_proj_cost)
+    print ""
+    print "### By Model"
+    print ""
+    print "| Model | Cost |"
+    print "|-------|------|"
+    print_model_table(w_model_cost)
+    print ""
+    print "---"
+    print ""
+    print "## All Time"
+    print ""
+    print "### By Project"
+    print ""
+    print "| Project | Tasks | Cost |"
+    print "|---------|-------|------|"
+    print_proj_table(a_proj_tasks, a_proj_cost)
+    print ""
+    print "### By Model"
+    print ""
+    print "| Model | Cost |"
+    print "|-------|------|"
+    print_model_table(a_model_cost)
+    print ""
+}
+' "${FILES[@]+"${FILES[@]}"}" > "$OUTPUT_FILE"
+
+echo "$OUTPUT_FILE"

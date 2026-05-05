@@ -1,10 +1,13 @@
 #!/bin/bash
 # ltask: list tasks - show plan, inbox, and running tasks
 
+BACKLOG_DIR=~/tasks/backlog
+BACKLOG_REVIEW_DIR=~/tasks/backlog-for-review
 PLAN_DIR=~/tasks/plan
-PLANNED_DIR=~/tasks/planned
+PLAN_REVIEW_DIR=~/tasks/plan-for-review
 INBOX=~/tasks/inbox
 RUN_DIR=~/tasks/run
+REVIEW_DIR=~/tasks/review
 
 _count_and_list() {
     local label="$1"
@@ -27,7 +30,10 @@ _count_and_list() {
     echo ""
 }
 
-_count_and_list "Plan"    "$PLAN_DIR"
-_count_and_list "Planned" "$PLANNED_DIR"
-_count_and_list "Inbox"   "$INBOX"
-_count_and_list "Running" "$RUN_DIR"
+_count_and_list "Backlog"            "$BACKLOG_DIR"
+_count_and_list "Backlog for review" "$BACKLOG_REVIEW_DIR"
+_count_and_list "Plan"               "$PLAN_DIR"
+_count_and_list "Plan for review"    "$PLAN_REVIEW_DIR"
+_count_and_list "Inbox"              "$INBOX"
+_count_and_list "Running"            "$RUN_DIR"
+_count_and_list "Review"             "$REVIEW_DIR"
