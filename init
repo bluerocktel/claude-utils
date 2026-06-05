@@ -5,7 +5,7 @@ TASKS_DIR=~/tasks
 
 echo "Initializing $TASKS_DIR ..."
 
-mkdir -p "$TASKS_DIR/backlog" "$TASKS_DIR/backlog-for-review" "$TASKS_DIR/inbox" "$TASKS_DIR/run" "$TASKS_DIR/done" "$TASKS_DIR/review" "$TASKS_DIR/plan" "$TASKS_DIR/plan-for-review"
+mkdir -p "$TASKS_DIR/briefs" "$TASKS_DIR/backlog" "$TASKS_DIR/backlog-for-review" "$TASKS_DIR/inbox" "$TASKS_DIR/run" "$TASKS_DIR/done" "$TASKS_DIR/review" "$TASKS_DIR/plan" "$TASKS_DIR/plan-for-review" "$TASKS_DIR/drafts"
 
 SAMPLE="$TASKS_DIR/backlog/sample-task.md"
 if [ ! -f "$SAMPLE" ]; then
@@ -45,6 +45,8 @@ fi
 
 echo ""
 echo "Done. Task directories ready:"
+echo "  $TASKS_DIR/briefs/"
+echo "  $TASKS_DIR/drafts/"
 echo "  $TASKS_DIR/backlog/"
 echo "  $TASKS_DIR/backlog-for-review/"
 echo "  $TASKS_DIR/plan/"
@@ -54,5 +56,11 @@ echo "  $TASKS_DIR/run/"
 echo "  $TASKS_DIR/done/"
 echo "  $TASKS_DIR/review/"
 echo ""
-echo "To run tasks automatically, add this to your crontab (crontab -e):"
-echo "  */15 * * * * $HOME/bin/claude-task >> $TASKS_DIR/cron.log 2>&1"
+echo "Recommended crontab entries (crontab -e):"
+echo "  */15 * * * * $HOME/bin/claude-brief        >> $TASKS_DIR/cron.log 2>&1"
+echo "  */15 * * * * $HOME/bin/claude-draft        >> $TASKS_DIR/cron.log 2>&1"
+echo "  */15 * * * * $HOME/bin/claude-prep         >> $TASKS_DIR/cron.log 2>&1"
+echo "  */15 * * * * $HOME/bin/claude-task         >> $TASKS_DIR/cron.log 2>&1"
+echo "  */30 * * * * $HOME/bin/claude-review-alert >> $TASKS_DIR/cron.log 2>&1"
+echo ""
+echo "The only manual step: review ~/tasks/backlog-for-review/ and move approved tasks to inbox/."

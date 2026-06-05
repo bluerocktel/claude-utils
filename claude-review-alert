@@ -1,0 +1,17 @@
+#!/bin/bash
+# claude-review-alert: notify when tasks are stuck in review/ after exhausting retries
+#
+# Designed to run from cron. Sends a critical desktop notification listing how many
+# tasks need manual intervention. Safe to run frequently — exits silently when empty.
+#
+# Usage:
+#   claude-review-alert          # check and notify if review/ is non-empty
+
+REVIEW_DIR=~/tasks/review
+
+FILES=("$REVIEW_DIR"/*.md)
+[ -f "${FILES[0]}" ] || exit 0
+
+COUNT=${#FILES[@]}
+NAMES=$(for f in "${FILES[@]}"; do basename "$f" .md; done | paste -sd ', ')
+notify-send -u critical "Claude: $COUNT task(s) need review" "$NAMES"

@@ -1,0 +1,25 @@
+#!/bin/bash
+# claude-briefs: decompose all briefs in ~/tasks/briefs/ in parallel
+#
+# Usage: claude-briefs
+
+BRIEFS_DIR=~/tasks/briefs
+
+mkdir -p "$BRIEFS_DIR"
+
+BRIEFS=("$BRIEFS_DIR"/*.md)
+
+if [ ! -f "${BRIEFS[0]}" ]; then
+    echo "No .md brief files found in $BRIEFS_DIR"
+    exit 1
+fi
+
+COUNT=0
+for BRIEF_FILE in "${BRIEFS[@]}"; do
+    "$HOME/bin/claude-brief" "$BRIEF_FILE"
+    COUNT=$((COUNT + 1))
+done
+
+echo ""
+echo "$COUNT brief(s) launched in parallel."
+echo "List sessions : tmux ls"

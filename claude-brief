@@ -1,0 +1,158 @@
+#!/bin/bash
+# claude-brief: decompose a high-level brief into multiple structured task files
+#
+# Usage:
+#   claude-brief [brief.md]   Decompose brief (picks oldest from ~/tasks/briefs/ if no arg)
+#   claude-brief --run FILE   Internal mode used by tmux (do not call directly)
+
+BRIEFS_DIR=~/tasks/briefs
+BRIEFS_DONE_DIR=~/tasks/briefs/done
+RUN_DIR=~/tasks/run
+REVIEW_DIR=~/tasks/backlog-for-review
+
+# ── Internal execution mode ────────────────────────────────────────────────
+if [ "$1" = "--run" ]; then
+    BRIEF_FILE="$2"
+    BRIEF_NAME=$(basename "$BRIEF_FILE" .md)
+    TIMESTAMP=$(date '+%Y-%m-%d_%H-%M')
+    TODAY=$(date '+%Y-%m-%d')
+    RESULT_FILE="$RUN_DIR/${TIMESTAMP}_${BRIEF_NAME}.raw"
+    BRIEF_ARCHIVE="$HOME/tasks/briefs/done/${BRIEF_NAME}.md"
+
+    touch "$RESULT_FILE"
+    tail -f "$RESULT_FILE" &
+    TAIL_PID=$!
+
+    PREAMBLE="BRIEF DECOMPOSITION MODE: You are decomposing a high-level brief into multiple well-scoped autonomous task files ready for execution by claude-task.
+
+Your job, in order:
+
+1. Read the brief and find the ## Project field. Read ~/tasks/projects/{alias}.md to learn the working directory, stack, and conventions.
+
+2. Explore the codebase: grep and glob to find the specific files, line numbers, class names, and patterns the work touches. Exclude vendor/, node_modules/, storage/framework/ from all searches. Embed exact paths in every task you produce.
+
+3. Decide how many task files to create. Split when:
+   - Changes are in different areas and could be reviewed or rolled back independently
+   - One step produces output that a later step consumes (sequencing risk)
+   Keep together when changes are tightly coupled or touch only 2-3 files.
+
+4. Determine the execution order. If a task requires output from a prior task, mark it with a ## Depends-on section. The value is the SLUG of the task it waits for (no date prefix, no .md). claude-task will skip a blocked task and run it only once its dependency appears in done/.
+
+5. Write each task and output it using EXACTLY this delimiter format — nothing else in your output:
+
+===TASK_FILE_BEGIN: ${TODAY}_SLUG.md===
+## Project
+{alias}
+
+## Brief
+${BRIEF_ARCHIVE}
+
+## Depends-on
+{slug-of-prior-task — ONLY include this section if this task requires a prior task's output. Omit entirely for tasks with no dependency.}
+
+## Context
+{Why this change is needed. What currently exists. Exact file paths and line numbers you found in step 2. If this task consumes output from a prior task, state exactly what file or data it expects and where. If any decision requires understanding the full scope of the work, refer the executing agent to the ## Brief file.}
+
+## Tasks
+{Numbered concrete instructions. Exact strings to find/replace when relevant.}
+
+## Acceptance Criteria
+{Bulleted checklist of verifiable pass/fail items. Prefer shell-command-checkable criteria. Always end with a negative check confirming the old thing is gone.}
+===TASK_FILE_END===
+
+Replace SLUG with a short lowercase description specific to that task (not the whole brief).
+Use ${TODAY} as the date prefix for all filenames.
+
+CRITICAL RULES:
+- Output ONLY the delimited task blocks. No preamble, no commentary, no closing remarks, no code fences.
+- Every task must be self-contained: an autonomous agent picking it up cold must execute it with zero prior context.
+- Every task must be completable in a single focused session without hitting context limits. If a task touches more than 5 files, spans more than 3 distinct logical phases, or involves generating large volumes of content, split it into smaller tasks connected with ## Depends-on. Prefer more tasks over larger tasks.
+- Do not add scope beyond what the brief describes.
+- Do not create tasks that drop tables, delete migrations, or make irreversible infrastructure changes. Instead, write a task with a STOP warning in Context explaining what needs manual review.
+- Multi-language projects: make locale updates explicit in Tasks and Acceptance Criteria for every affected task.
+- Tasks run fully autonomously: no questions, no options, no waiting for input."
+
+    claude --dangerously-skip-permissions -p "$PREAMBLE
+
+$(cat "$BRIEF_FILE")" > "$RESULT_FILE" 2>&1
+    STATUS=$?
+
+    kill $TAIL_PID 2>/dev/null
+    wait $TAIL_PID 2>/dev/null
+
+    if [ $STATUS -ne 0 ] || [ ! -s "$RESULT_FILE" ]; then
+        notify-send -u critical "Claude: Brief Failed" "$BRIEF_NAME decomposition failed."
+        mv "$BRIEF_FILE" "$BRIEFS_DIR/${BRIEF_NAME}.md"
+        rm -f "$RESULT_FILE"
+        exit 1
+    fi
+
+    # Split Claude output into individual task files
+    N_FILES=$(awk -v dir="$REVIEW_DIR" '
+        /^===TASK_FILE_BEGIN: / {
+            sub(/^===TASK_FILE_BEGIN: /, "")
+            sub(/===[ \t]*$/, "")
+            filename = $0
+            in_file = 1
+            buffer = ""
+            next
+        }
+        /^===TASK_FILE_END===/ {
+            in_file = 0
+            print buffer > (dir "/" filename)
+            close(dir "/" filename)
+            n++
+            next
+        }
+        in_file {
+            buffer = (buffer ? buffer "\n" $0 : $0)
+        }
+        END { print (n ? n : 0) }
+    ' "$RESULT_FILE")
+
+    if [ "$N_FILES" -eq 0 ]; then
+        notify-send -u critical "Claude: Brief Failed" "$BRIEF_NAME produced no task files. Check $RESULT_FILE"
+        mv "$BRIEF_FILE" "$BRIEFS_DIR/${BRIEF_NAME}.md"
+        exit 1
+    fi
+
+    # Archive the brief to done/ — keeps .md so tasks can read it as context
+    mkdir -p "$BRIEFS_DONE_DIR"
+    mv "$BRIEF_FILE" "$BRIEF_ARCHIVE"
+
+    notify-send "Claude: Brief Decomposed" "$BRIEF_NAME → $N_FILES task(s) in backlog-for-review/"
+    exit 0
+fi
+
+# ── Launcher mode ──────────────────────────────────────────────────────────
+mkdir -p "$BRIEFS_DIR"
+
+if [ -n "$1" ]; then
+    BRIEF_FILE="$1"
+else
+    BRIEF_FILE=$(ls -tr "$BRIEFS_DIR"/*.md 2>/dev/null | head -1)
+fi
+
+if [ -z "$BRIEF_FILE" ] || [ ! -f "$BRIEF_FILE" ]; then
+    echo "Usage: claude-brief [brief.md]"
+    echo "No .md brief file found in $BRIEFS_DIR"
+    exit 1
+fi
+
+BRIEF_NAME=$(basename "$BRIEF_FILE" .md)
+SESSION="claude-brief-${BRIEF_NAME}"
+
+if tmux has-session -t "$SESSION" 2>/dev/null; then
+    echo "Session '$SESSION' already running. Attach: tmux attach -t $SESSION"
+    exit 1
+fi
+
+mkdir -p "$RUN_DIR"
+mv "$BRIEF_FILE" "$RUN_DIR/"
+BRIEF_FILE="$RUN_DIR/$(basename "$BRIEF_FILE")"
+
+tmux new-session -d -s "$SESSION" bash -lc "\"$HOME/bin/claude-brief\" --run \"$BRIEF_FILE\""
+
+echo "Decomposing '$BRIEF_NAME' in tmux session '$SESSION'."
+echo "Monitor : tmux attach -t $SESSION"
+echo "Result  : $REVIEW_DIR/"

@@ -2,7 +2,7 @@
 
 Shell utilities for running and managing [Claude Code](https://claude.ai/code) tasks autonomously.
 
-Write a task as a Markdown file, drop it in `~/tasks/backlog/`, let Claude prepare it with acceptance criteria, review it, then execute it autonomously.
+Write a task as a Markdown file, drop it in `~/tasks/backlog/`, let Claude prepare it with acceptance criteria, review it, then execute it autonomously. Or write a high-level brief in `~/tasks/briefs/` and let Claude decompose it into multiple ready-to-run task files in one shot.
 
 > **Note:** `claude-task` uses `--dangerously-skip-permissions`, which allows Claude to run shell commands, edit files, and use all tools without confirmation prompts. Only use this on machines and tasks you trust.
 
@@ -21,7 +21,7 @@ cd ~/Scripts/claude-utils
 cp config.example config
 # Edit config with your own values
 chmod +x ~/Scripts/claude-utils/*
-for script in claude-prep claude-preps claude-task claude-tasks claude-plan claude-plans claude-eval ltask vtask mtask dtask; do
+for script in claude-brief claude-briefs claude-draft claude-prep claude-preps claude-task claude-tasks claude-plan claude-plans claude-eval claude-review-alert ltask vtask mtask dtask; do
   ln -s ~/Scripts/claude-utils/$script ~/bin/$script
 done
 ln -s ~/Scripts/claude-utils/init ~/bin/claude-init
@@ -40,10 +40,36 @@ claude-init
 
 ### `claude-init`
 
-Creates `~/tasks/{backlog,backlog-for-review,plan,plan-for-review,inbox,run,done,review}/` and drops a `sample-task.md` in backlog. Run once per machine.
+Creates `~/tasks/{drafts,backlog,backlog-for-review,plan,plan-for-review,inbox,run,done,review}/` and drops a `sample-task.md` in backlog. Run once per machine.
 
 ```
 claude-init
+```
+
+### `claude-brief`
+
+Decomposes a high-level brief into multiple well-scoped task files ready for review. Write a brief describing a feature, fix, or batch of related changes in `~/tasks/briefs/`, then run `claude-brief`. Claude reads the project file, explores the codebase to find exact file paths and line numbers, decides how many tasks are needed, and writes each one to `~/tasks/backlog-for-review/` with full structure and acceptance criteria. Use this when you know what you want to build but don't want to write each task individually.
+
+Brief format (minimal):
+```markdown
+## Project
+myproject
+
+Describe the feature or changes you want. Write as loosely as you like.
+Claude will explore the codebase and create as many tasks as needed.
+```
+
+```
+claude-brief                   # picks oldest brief from ~/tasks/briefs/
+claude-brief path/to/brief.md  # process a specific file
+```
+
+### `claude-briefs`
+
+Launches decomposition for all `.md` files in `~/tasks/briefs/` in parallel, each in its own tmux session.
+
+```
+claude-briefs
 ```
 
 ### `claude-draft`
@@ -91,7 +117,7 @@ claude-plans
 
 ### `claude-eval`
 
-Evaluates a completed task result against its `## Acceptance Criteria`. Called automatically by `claude-task` after each execution — you rarely need to run it directly. If all criteria pass, the task proceeds to `done/`. If any fail, the task is re-queued to `inbox/` with the evaluator's feedback appended. After `max_retries` failed attempts (default: 3), the task moves to `review/` for manual inspection.
+Evaluates a completed task result against its `## Acceptance Criteria`. Called automatically by `claude-task` after each execution — you rarely need to run it directly. If all criteria pass, the task proceeds to `done/`. If any fail, the task is re-queued to `inbox/` with the evaluator's feedback appended. On the second failed attempt and beyond, a strategist pass runs before re-queuing: it reads the full failure history and appends a `## Retry Strategy` section suggesting a concrete alternative approach for the next attempt. After `max_retries` failed attempts (default: 3), the task moves to `review/` for manual inspection.
 
 Tasks without an `## Acceptance Criteria` section skip evaluation entirely.
 
@@ -159,6 +185,14 @@ mtask      # most recent
 mtask 2    # second-to-last
 ```
 
+### `claude-review-alert`
+
+Sends a critical desktop notification listing any tasks stuck in `~/tasks/review/` after exhausting all retries. Designed to run from cron every 30 minutes. Exits silently when `review/` is empty.
+
+```
+claude-review-alert
+```
+
 ### `morning-briefing`
 
 Generates a daily Markdown report of the last 24 hours of task activity and writes it to `~/Notes/briefing-YYYY-MM-DD.md`. The report contains four sections: tasks completed, inbox queue, backlog snapshot (with age warnings for items older than 14 days), and a spend table summarising API cost by project. A cron entry runs it automatically at 07:00 each day.
@@ -178,6 +212,9 @@ morning-briefing --print   # write report and also print to stdout
 ```
 ~/tasks/
   projects/           # project context files (one per project, see "Project context" section)
+  briefs/             # high-level feature descriptions waiting to be decomposed by claude-brief
+  briefs/done/        # archived briefs after decomposition (referenced by ## Brief in tasks)
+  drafts/             # brain dumps for claude-draft to split into backlog tasks
   backlog/            # rough task ideas, brief descriptions
   backlog-for-review/ # Claude-prepared tasks with acceptance criteria (review before promoting)
   plan/               # tasks needing a full implementation plan
@@ -192,7 +229,9 @@ morning-briefing --print   # write report and also print to stdout
 
 ### Task workflow
 
-All tasks start in `backlog/`:
+**Fast path: start from a brief (recommended for multi-task work)**
+
+0. Write a high-level description of a feature or set of changes in `~/tasks/briefs/`, then run `claude-brief`: Claude explores the codebase and writes N structured tasks directly to `~/tasks/backlog-for-review/`
 
 **Optional: start from a brain dump**
 
@@ -215,19 +254,23 @@ All tasks start in `backlog/`:
 
 ## Crontab automation
 
-To pick up and run inbox tasks automatically, add `claude-task` to your crontab:
+The full pipeline can run automatically. The only step that requires your attention is reviewing prepared tasks in `backlog-for-review/` and promoting them to `inbox/`.
+
+Add these entries to your crontab (`crontab -e`):
 
 ```
-crontab -e
+*/15 * * * * $HOME/bin/claude-brief        >> $HOME/tasks/cron.log 2>&1
+*/15 * * * * $HOME/bin/claude-draft        >> $HOME/tasks/cron.log 2>&1
+*/15 * * * * $HOME/bin/claude-prep         >> $HOME/tasks/cron.log 2>&1
+*/15 * * * * $HOME/bin/claude-task         >> $HOME/tasks/cron.log 2>&1
+*/30 * * * * $HOME/bin/claude-review-alert >> $HOME/tasks/cron.log 2>&1
 ```
 
-Recommended entry (every 15 minutes):
+All scripts exit silently when there is nothing to process, so frequent polling is safe. With these entries the flow becomes:
 
-```
-*/15 * * * * $HOME/bin/claude-task >> $HOME/tasks/cron.log 2>&1
-```
-
-`claude-task` exits silently with no error when the inbox is empty, so frequent polling is safe.
+1. Drop a brief in `~/tasks/briefs/` (or a brain dump in `~/tasks/drafts/`, or a rough task in `~/tasks/backlog/`) — cron does the rest.
+2. Review prepared tasks in `~/tasks/backlog-for-review/` and move approved ones to `~/tasks/inbox/`.
+3. Receive a desktop alert if any task exhausts its retries and lands in `~/tasks/review/`.
 
 ## Project context
 
@@ -276,6 +319,9 @@ Claude will read `~/tasks/projects/myproject.md` automatically before starting w
 ```
 ~/tasks/
   projects/           # project context files (one per project)
+  briefs/             # high-level feature descriptions waiting to be decomposed
+  briefs/done/        # archived briefs after decomposition (referenced by ## Brief in tasks)
+  drafts/             # brain dumps for claude-draft to split into backlog tasks
   backlog/            # rough task ideas, brief descriptions
   backlog-for-review/ # Claude-prepared tasks with acceptance criteria
   plan/               # tasks needing a full implementation plan
@@ -287,6 +333,12 @@ Claude will read `~/tasks/projects/myproject.md` automatically before starting w
   DONE.md             # running log of all completed/failed/requeued tasks
   cron.log            # cron output (if using crontab automation)
 ```
+
+## Task size rule
+
+Both `claude-prep` and `claude-brief` enforce a size constraint: a task that touches more than 5 files or spans more than 3 distinct logical phases is split automatically into multiple smaller tasks connected with `## Depends-on`. This keeps each task within the model's effective context window and avoids silent quality degradation from mid-session context compaction.
+
+If `claude-prep` splits a task, it outputs multiple files to `backlog-for-review/` instead of one, and sends a "Task Split" notification.
 
 ## Writing a task
 
@@ -301,7 +353,7 @@ Claude runs fully autonomously: no questions, no prompts. Be explicit.
 
 ### Acceptance Criteria and evaluation
 
-If your task file contains an `## Acceptance Criteria` section, `claude-eval` runs automatically after execution and grades the result against each criterion. Failed tasks are re-queued with the evaluator's feedback appended, so the next attempt sees exactly what went wrong.
+If your task file contains an `## Acceptance Criteria` section, `claude-eval` runs automatically after execution and grades the result against each criterion. Failed tasks are re-queued with the evaluator's feedback appended. From the second failure onward, a strategist pass also runs: it reviews the full failure history and appends a `## Retry Strategy` section with a concrete alternative approach, so repeated attempts don't keep hitting the same wall.
 
 ```markdown
 ## Acceptance Criteria

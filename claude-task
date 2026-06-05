@@ -124,6 +124,30 @@ $(cat "$TASK_FILE")" --output-format json > "$JSON_TMP" 2>&1
                 printf "\n## Retries\n%s\n" "$NEW_RETRIES" >> "$TASK_FILE"
             fi
 
+            # On retry 2+, run a strategist to diagnose the failure pattern and suggest
+            # a different approach before the next attempt sees the task.
+            if [ "$NEW_RETRIES" -ge 2 ]; then
+                STRATEGY_TMP=$(mktemp)
+                claude --dangerously-skip-permissions $MODEL_FLAG -p \
+"STRATEGY MODE: This task has failed evaluation $NEW_RETRIES times. Diagnose the recurring failure pattern and suggest a concrete alternative approach for the next attempt.
+
+Rules:
+- Read the original task instructions and all ## Evaluator Feedback sections carefully.
+- Identify what keeps going wrong: wrong approach, misread requirement, missing step, environment issue?
+- Suggest a specific, different strategy. Name files, methods, commands, or patterns to try instead.
+- Be concrete and actionable. Under 10 lines. No praise, no preamble, no closing remark.
+- Output only raw Markdown starting with exactly: ## Retry Strategy (Attempt $NEW_RETRIES)
+
+---
+$(cat "$TASK_FILE")" --output-format json > "$STRATEGY_TMP" 2>&1
+
+                STRATEGY_TEXT=$(jq -r '.result // ""' "$STRATEGY_TMP" 2>/dev/null)
+                rm -f "$STRATEGY_TMP"
+                if [ -n "$STRATEGY_TEXT" ]; then
+                    printf '\n%s\n' "$STRATEGY_TEXT" >> "$TASK_FILE"
+                fi
+            fi
+
             {
                 echo "## $(date '+%Y-%m-%d %H:%M') - $TASK_NAME"
                 echo ""

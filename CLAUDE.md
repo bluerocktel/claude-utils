@@ -6,8 +6,10 @@ See README.md for full project documentation, script descriptions, and setup ins
 
 ### What this repo is
 
-Shell scripts that drive autonomous Claude Code task execution. The full flow:
-`backlog/` → `claude-prep` → `backlog-for-review/` → (user review) → `inbox/` or `plan/` → `claude-task`/`claude-plan` → `done/`/`plan-for-review/`.
+Shell scripts that drive autonomous Claude Code task execution. Two entry points:
+
+- **Brief flow** (recommended for multi-task work): `briefs/` → `claude-brief` → `backlog-for-review/` → (user review) → `inbox/` → `claude-task`/`claude-tasks` → `done/`
+- **Standard flow**: `backlog/` → `claude-prep` → `backlog-for-review/` → (user review) → `inbox/` or `plan/` → `claude-task`/`claude-plan` → `done/`/`plan-for-review/`
 
 ### Conventions
 
@@ -21,8 +23,15 @@ Shell scripts that drive autonomous Claude Code task execution. The full flow:
 - `claude-task` calls itself via `$HOME/bin/claude-task --run` for the internal tmux execution. If you rename the script, update that self-reference.
 - `claude-tasks` also references `$HOME/bin/claude-task` directly. Keep both in sync if the name changes.
 - `claude-prep` and `claude-plan` use the same self-call pattern (`$HOME/bin/claude-prep --run`, `$HOME/bin/claude-plan --run`). Keep symlink names in sync.
-- `claude-preps` and `claude-plans` reference their respective single-task scripts via `$HOME/bin/`.
+- `claude-brief` uses the same self-call pattern (`$HOME/bin/claude-brief --run`). Keep symlink name in sync.
+- `claude-preps`, `claude-plans`, and `claude-briefs` reference their respective single-task scripts via `$HOME/bin/`.
 - `mtask` sources `config` at runtime via `realpath "$0"`, so it works correctly through the symlink.
+- `claude-prep` can output either a single task file (raw Markdown) or multiple delimiter-separated task files if the task size rule triggers a split. The post-processor detects which case applies automatically.
+- `claude-brief` archives the original brief to `~/tasks/briefs/done/` and embeds a `## Brief` path in every generated task. Do not move or rename that archive — tasks reference it at runtime.
+
+### Task size rule
+
+Both `claude-prep` and `claude-brief` enforce a size constraint in their preambles: a task touching more than 5 files or spanning more than 3 distinct logical phases must be split into smaller tasks connected with `## Depends-on`. This keeps each task within the model's effective context window (~40%) and prevents silent quality degradation from context compaction.
 
 ### Adding a script
 

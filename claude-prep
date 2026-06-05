@@ -14,6 +14,7 @@ if [ "$1" = "--run" ]; then
     TASK_FILE="$2"
     TASK_NAME=$(basename "$TASK_FILE" .md)
     TIMESTAMP=$(date '+%Y-%m-%d_%H-%M')
+    TODAY=$(date '+%Y-%m-%d')
     RESULT_FILE="$REVIEW_DIR/${TIMESTAMP}_${TASK_NAME}.md"
 
     touch "$RESULT_FILE"
@@ -29,23 +30,85 @@ Read the rough task description and produce a complete Markdown task file with:
 - ## Expected outcome: what success looks like.
 - ## Acceptance Criteria: specific, verifiable pass/fail items that an evaluator can check.
 
-Keep the original intent. Add structure and clarity, not scope. Output only the task file content, no commentary."
+Keep the original intent. Add structure and clarity, not scope.
+
+TASK SIZE RULE: Each task must be completable in a single focused session without hitting context limits. If the task touches more than 5 files, spans more than 3 distinct logical phases, or involves generating large volumes of content, it is too large — split it into multiple smaller tasks connected with ## Depends-on (the value is the slug of the prior task, no date prefix, no .md extension). Prefer more tasks over larger tasks.
+
+OUTPUT FORMAT — choose based on whether splitting is needed:
+
+Single task (fits the size rule): output raw Markdown starting directly with the first ## heading. No code fences, no preamble, no commentary.
+
+Split tasks (task is too large): output each sub-task using EXACTLY this delimiter format:
+===TASK_FILE_BEGIN: ${TODAY}_SLUG.md===
+(task content starting with the first ## heading)
+===TASK_FILE_END===
+Replace SLUG with a short lowercase description specific to that sub-task. Connect dependent tasks with ## Depends-on (slug only, no date prefix, no .md).
+
+In both cases: no introductory sentence, no closing remarks, no code fences around the delimiters themselves."
 
     claude --dangerously-skip-permissions -p "$PREAMBLE
 
 $(cat "$TASK_FILE")" > "$RESULT_FILE" 2>&1
     STATUS=$?
 
+    # Post-process: handle single-task or split-task output
+    N_FILES=0
+    SPLIT=0
+    if grep -q "^===TASK_FILE_BEGIN: " "$RESULT_FILE"; then
+        SPLIT=1
+        N_FILES=$(awk -v dir="$REVIEW_DIR" '
+            /^===TASK_FILE_BEGIN: / {
+                sub(/^===TASK_FILE_BEGIN: /, "")
+                sub(/===[ \t]*$/, "")
+                filename = $0
+                in_file = 1
+                buffer = ""
+                next
+            }
+            /^===TASK_FILE_END===/ {
+                in_file = 0
+                print buffer > (dir "/" filename)
+                close(dir "/" filename)
+                n++
+                next
+            }
+            in_file {
+                buffer = (buffer ? buffer "\n" $0 : $0)
+            }
+            END { print (n ? n : 0) }
+        ' "$RESULT_FILE")
+        rm -f "$RESULT_FILE"
+    else
+        # Single task: strip any leading commentary / code-fence wrapper
+        awk '
+            /^## / { found=1 }
+            found { lines[n++] = $0 }
+            END {
+                if (n > 0 && lines[n-1] ~ /^```[[:space:]]*$/) n--
+                for (i=0; i<n; i++) print lines[i]
+            }
+        ' "$RESULT_FILE" > "${RESULT_FILE}.tmp" && mv "${RESULT_FILE}.tmp" "$RESULT_FILE"
+    fi
+
     kill $TAIL_PID 2>/dev/null
     wait $TAIL_PID 2>/dev/null
 
-    if [ $STATUS -eq 0 ] && [ -s "$RESULT_FILE" ]; then
-        # Archive original (without .md) so it won't be picked up again
+    SUCCESS=0
+    if [ $STATUS -eq 0 ]; then
+        if [ "$SPLIT" -eq 1 ] && [ "$N_FILES" -gt 0 ]; then SUCCESS=1
+        elif [ "$SPLIT" -eq 0 ] && [ -s "$RESULT_FILE" ]; then SUCCESS=1
+        fi
+    fi
+
+    if [ "$SUCCESS" -eq 1 ]; then
         mv "$TASK_FILE" "$BACKLOG_DIR/$(basename "$TASK_FILE" .md)"
-        notify-send "Claude: Task Prepared" "$TASK_NAME. Review in ~/tasks/backlog-for-review/"
+        if [ "$SPLIT" -eq 1 ]; then
+            notify-send "Claude: Task Split" "$TASK_NAME → $N_FILES tasks in backlog-for-review/"
+        else
+            notify-send "Claude: Task Prepared" "$TASK_NAME. Review in ~/tasks/backlog-for-review/"
+        fi
     else
         notify-send -u critical "Claude: Prep Failed" "$TASK_NAME preparation failed. See $RESULT_FILE"
-        # Move original back to backlog so it can be retried
         mv "$TASK_FILE" "$BACKLOG_DIR/$(basename "$TASK_FILE")"
         rm -f "$RESULT_FILE"
         exit 1
