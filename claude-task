@@ -34,7 +34,7 @@ if [ "$1" = "--run" ]; then
         echo ""
     } > "$RESULT_FILE"
 
-    PREAMBLE="AUTONOMOUS MODE: You have no user to interact with. Never ask questions, never present options, never wait for confirmation. Make decisions and implement immediately. Document choices in a ## Summary at the end. After the ## Summary, always add a ## Tools Used section listing: (1) Agents: any agents from ~/.claude/agents/ that were invoked (list by name, or 'none'); (2) Skills: any skills that were invoked (list by name, or 'none'). After ## Tools Used, add a ## Suggested Commit Message section containing a ready-to-use git commit message (subject line + optional body) that accurately describes all changes made. Do not run git commit yourself."
+    PREAMBLE="AUTONOMOUS MODE: You have no user to interact with. Never ask questions, never present options, never wait for confirmation. Make decisions and implement immediately. Document choices in a ## Summary at the end. After the ## Summary, always add a ## Tools Used section listing: (1) Agents: any agents from ~/.claude/agents/ that were invoked (list by name, or 'none'); (2) Skills: any skills that were invoked (list by name, or 'none'). After ## Tools Used, add a ## Suggested Commit Message section containing a ready-to-use git commit message (subject line + optional body) that accurately describes all changes made. Do not run git commit yourself. CRITICAL: Never use git checkout, git restore, or git reset to undo a previous attempt's changes. Any untracked files or unstaged modifications you find in the working tree may be legitimate work from other concurrently-running tasks — do not delete or revert them. If you need to undo your own specific changes from a previous attempt, edit only the exact lines you added."
 
     # Resolve optional model override from task frontmatter (## Model field)
     MODEL_FLAG=""
@@ -158,7 +158,7 @@ $(cat "$TASK_FILE")" --output-format json > "$STRATEGY_TMP" 2>&1
 
             mv "$TASK_FILE" "$INBOX/${TASK_NAME}.md"
             rm -f "$EVAL_OUTPUT"
-            notify-send "Claude: Task Requeued" "$TASK_NAME failed evaluation (retry $NEW_RETRIES/$MAX_RETRIES). Requeued."
+            notify-send "Claude: Task Requeued" "$TASK_NAME${WORKFLOW_LABEL} failed evaluation (retry $NEW_RETRIES/$MAX_RETRIES). Requeued."
             exit 0
         else
             # Max retries exhausted — append final feedback to result and move to review
@@ -177,7 +177,7 @@ $(cat "$TASK_FILE")" --output-format json > "$STRATEGY_TMP" 2>&1
 
             mv "$TASK_FILE" "$REVIEW_DIR/${TASK_NAME}.md"
             rm -f "$EVAL_OUTPUT"
-            notify-send -u critical "Claude: Needs Review" "$TASK_NAME failed evaluation after $MAX_RETRIES retries."
+            notify-send -u critical "Claude: Needs Review" "$TASK_NAME${WORKFLOW_LABEL} failed evaluation after $MAX_RETRIES retries."
             exit 1
         fi
     fi
@@ -200,9 +200,9 @@ $(cat "$TASK_FILE")" --output-format json > "$STRATEGY_TMP" 2>&1
     # Archive original task file alongside its result
     if [ $STATUS -eq 0 ]; then
         mv "$TASK_FILE" "$DONE_DIR/${TIMESTAMP}_${TASK_NAME}.task.md"
-        notify-send "Claude: Task Done" "$TASK_NAME completed successfully."
+        notify-send "Claude: Task Done" "$TASK_NAME${WORKFLOW_LABEL} completed successfully."
     else
-        notify-send -u critical "Claude: Task Failed" "$TASK_NAME failed. See $RESULT_FILE"
+        notify-send -u critical "Claude: Task Failed" "$TASK_NAME${WORKFLOW_LABEL} failed. See $RESULT_FILE"
     fi
 
     exit $STATUS
