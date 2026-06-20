@@ -1,2 +1,4 @@
 email=
 max_retries=3
+# Minutes the launcher pauses after an auth failure before retrying (default 30).
+auth_cooldown_min=30

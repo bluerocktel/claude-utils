@@ -8,9 +8,18 @@
 #   0 = PASS
 #   1 = FAIL
 #   2 = no ## Acceptance Criteria section found (skip evaluation)
+#   3 = inconclusive: the evaluator call itself failed to authenticate
+#       (auth/environment failure, NOT a task-quality failure). Callers must
+#       not treat this as a FAIL or burn a retry on it.
 #
 # If OUTPUT_FILE is given, evaluator response is written there.
 # Otherwise it is printed to stdout.
+
+# Signature of an auth/credentials failure (expired token, 401). Matches the
+# text Claude emits to stdout/stderr when it cannot authenticate.
+is_auth_failure() {
+    grep -qiE 'API Error: 401|Invalid authentication credentials|OAuth token (has )?expired|Failed to authenticate' "$1"
+}
 
 TASK_FILE="$1"
 RESULT_FILE="$2"
@@ -119,13 +128,21 @@ claude --dangerously-skip-permissions $MODEL_FLAG \
 CLAUDE_STATUS=$?
 
 EVAL_TEXT=$(jq -r '.result // ""' "$JSON_TMP" 2>/dev/null)
-rm -f "$PROMPT_TMP" "$JSON_TMP"
 
 if [ -n "$OUTPUT_FILE" ]; then
     printf '%s\n' "$EVAL_TEXT" > "$OUTPUT_FILE"
 else
     printf '%s\n' "$EVAL_TEXT"
 fi
+
+# If the evaluator itself could not authenticate, the verdict is meaningless.
+# Report inconclusive (3) so the caller defers instead of failing the task.
+if is_auth_failure "$JSON_TMP" || { [ -z "$EVAL_TEXT" ] && [ $CLAUDE_STATUS -ne 0 ]; }; then
+    rm -f "$PROMPT_TMP" "$JSON_TMP"
+    exit 3
+fi
+
+rm -f "$PROMPT_TMP" "$JSON_TMP"
 
 if [ $CLAUDE_STATUS -ne 0 ]; then
     exit 1

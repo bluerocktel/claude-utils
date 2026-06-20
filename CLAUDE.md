@@ -29,6 +29,15 @@ Shell scripts that drive autonomous Claude Code task execution. Two entry points
 - `claude-prep` can output either a single task file (raw Markdown) or multiple delimiter-separated task files if the task size rule triggers a split. The post-processor detects which case applies automatically.
 - `claude-brief` archives the original brief to `~/tasks/briefs/done/` and embeds a `## Brief` path in every generated task. Do not move or rename that archive — tasks reference it at runtime.
 
+### Auth-failure circuit-breaker
+
+An auth/credentials failure (expired token, `API Error: 401`) means no work happened, so it must never be treated as a task-quality failure:
+
+- `claude-task` detects it (`is_auth_failure`) right after the main `claude -p` call. The task is requeued to `inbox/` **unchanged** — no retry burned, never sent to `review/`. A marker file `~/tasks/.auth-cooldown` is dropped.
+- `claude-eval` returns a new exit code **3** when the evaluator call itself can't authenticate (verdict is meaningless). `claude-task` treats exit 3 the same way (defer, no retry).
+- The launcher pauses the unattended (no-arg / cron) path while `~/tasks/.auth-cooldown` is younger than `auth_cooldown_min` minutes (config, default 30). An explicit task argument bypasses the pause. The marker is cleared on the first successful (non-401) run and ages out on its own.
+- To resume immediately after re-authenticating: run a task manually, or `rm ~/tasks/.auth-cooldown`.
+
 ### Task size rule
 
 Both `claude-prep` and `claude-brief` enforce a size constraint in their preambles: a task touching more than 5 files or spanning more than 3 distinct logical phases must be split into smaller tasks connected with `## Depends-on`. This keeps each task within the model's effective context window (~40%) and prevents silent quality degradation from context compaction.

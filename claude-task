@@ -10,6 +10,14 @@ RUN_DIR=~/tasks/run
 DONE_DIR=~/tasks/done
 REVIEW_DIR=~/tasks/review
 LOG=~/tasks/DONE.md
+COOLDOWN=~/tasks/.auth-cooldown   # marker dropped on an auth failure; pauses launches
+
+# True if the file contains the signature of an auth/credentials failure
+# (expired token, 401). Such a failure means no work was done — it must never
+# be counted as a task failure or burn a retry.
+is_auth_failure() {
+    grep -qiE 'API Error: 401|Invalid authentication credentials|OAuth token (has )?expired|Failed to authenticate' "$1"
+}
 
 # ── Internal execution mode ────────────────────────────────────────────────
 if [ "$1" = "--run" ]; then
@@ -47,14 +55,53 @@ if [ "$1" = "--run" ]; then
         *)      MODEL_FLAG="--model $RAW_MODEL" ;;
     esac
 
+    # Detect ## Workflow flag — if present, run as a dynamic workflow via ultracode
+    WORKFLOW_PREFIX=""
+    WORKFLOW_LABEL=""
+    if grep -q "^## Workflow" "$TASK_FILE"; then
+        WORKFLOW_PREFIX="ultracode: "
+        WORKFLOW_LABEL=" (workflow)"
+    fi
+
     JSON_TMP=$(mktemp)
     TOKEN_TMP=$(mktemp)
 
     # --output-format json captures usage stats; no live streaming to RESULT_FILE during execution
-    claude --dangerously-skip-permissions $MODEL_FLAG -p "$PREAMBLE
+    claude --dangerously-skip-permissions $MODEL_FLAG -p "${WORKFLOW_PREFIX}${PREAMBLE}
 
 $(cat "$TASK_FILE")" --output-format json > "$JSON_TMP" 2>&1
     STATUS=$?
+
+    # ── Auth-failure circuit-breaker ─────────────────────────────────────────
+    # A 401/expired-token means no work happened. Defer the task back to the
+    # inbox UNCHANGED (no retry burned, not sent to review), drop a cooldown
+    # marker so the launcher stops hammering, and bail out. The queue resumes
+    # automatically once the user re-authenticates.
+    if is_auth_failure "$JSON_TMP"; then
+        {
+            echo "Deferred: authentication failure (no work performed, retry not counted)."
+            echo "$(jq -r '.result // ""' "$JSON_TMP" 2>/dev/null)"
+            echo ""
+            echo "---"
+            echo ""
+            echo "**Deferred:** $(date '+%Y-%m-%d %H:%M') — requeued to inbox pending re-authentication."
+        } >> "$RESULT_FILE"
+        {
+            echo "## $(date '+%Y-%m-%d %H:%M') - $TASK_NAME"
+            echo ""
+            echo "**Status:** DEFERRED (auth failure — not counted as retry)"
+            echo "**Result:** \`$RESULT_FILE\`"
+            echo ""
+        } >> "$LOG"
+        touch "$COOLDOWN"
+        mv "$TASK_FILE" "$INBOX/${TASK_NAME}.md"
+        rm -f "$JSON_TMP" "$TOKEN_TMP"
+        notify-send -u critical "Claude: Auth Failure" "$TASK_NAME${WORKFLOW_LABEL} deferred — re-authenticate (e.g. /login). Queue paused for cooldown."
+        exit 0
+    fi
+
+    # Auth is working — clear any stale cooldown marker so the queue resumes.
+    rm -f "$COOLDOWN"
 
     # Write Claude's response text to the result file
     jq -r '.result // ""' "$JSON_TMP" > "$TOKEN_TMP.result" 2>/dev/null
@@ -100,6 +147,24 @@ $(cat "$TASK_FILE")" --output-format json > "$JSON_TMP" 2>&1
     EVAL_OUTPUT=$(mktemp)
     "$HOME/bin/claude-eval" "$TASK_FILE" "$RESULT_FILE" "$EVAL_OUTPUT"
     EVAL_STATUS=$?
+
+    # Exit 3 = the evaluator itself could not authenticate. The task may well
+    # have succeeded, but we cannot verify it. Defer like an auth failure:
+    # requeue unchanged, no retry burned, drop the cooldown marker.
+    if [ $EVAL_STATUS -eq 3 ]; then
+        {
+            echo "## $(date '+%Y-%m-%d %H:%M') - $TASK_NAME"
+            echo ""
+            echo "**Status:** DEFERRED (evaluator auth failure — not counted as retry)"
+            echo "**Result:** \`$RESULT_FILE\`"
+            echo ""
+        } >> "$LOG"
+        touch "$COOLDOWN"
+        mv "$TASK_FILE" "$INBOX/${TASK_NAME}.md"
+        rm -f "$EVAL_OUTPUT"
+        notify-send -u critical "Claude: Auth Failure" "$TASK_NAME${WORKFLOW_LABEL} ran but could not be evaluated (auth). Deferred for re-check."
+        exit 0
+    fi
 
     if [ $EVAL_STATUS -eq 1 ]; then
         RETRIES=$(awk '/^## Retries/{found=1; next} found && /^[0-9]+$/{print; exit} found && /^##/{exit}' "$TASK_FILE" | tr -d '[:space:]')
@@ -216,6 +281,22 @@ dep_satisfied() {
     dep="${dep%.md}"
     ls "$DONE_DIR"/*_"${dep}".task.md 2>/dev/null | grep -q .
 }
+
+# ── Auth cooldown guard ──────────────────────────────────────────────────────
+# If a recent run hit an auth failure, pause the unattended (no-arg / cron)
+# path so we don't re-fail every 15 minutes. An explicit task argument bypasses
+# this — the user can manually kick a task after re-authenticating; a successful
+# run clears the marker. The marker also ages out on its own.
+SCRIPT_DIR="$(dirname "$(realpath "$0")")"
+CONFIG="$SCRIPT_DIR/config"
+AUTH_COOLDOWN_MIN=30
+[ -f "$CONFIG" ] && { source "$CONFIG"; AUTH_COOLDOWN_MIN=${auth_cooldown_min:-30}; }
+
+if [ -z "$1" ] && [ -f "$COOLDOWN" ] && find "$COOLDOWN" -mmin -"$AUTH_COOLDOWN_MIN" 2>/dev/null | grep -q .; then
+    echo "Auth cooldown active (last auth failure < ${AUTH_COOLDOWN_MIN}m ago). Skipping."
+    echo "Re-authenticate (e.g. /login), then run a task manually or 'rm $COOLDOWN' to resume now."
+    exit 0
+fi
 
 # ── Launcher mode ──────────────────────────────────────────────────────────
 if [ -n "$1" ]; then
