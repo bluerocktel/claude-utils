@@ -30,8 +30,39 @@ if [ "$1" = "--run" ]; then
     SCRIPT_DIR="$(dirname "$(realpath "$0")")"
     CONFIG="$SCRIPT_DIR/config"
     MAX_RETRIES=3
-    [ -f "$CONFIG" ] && { source "$CONFIG"; MAX_RETRIES=${max_retries:-3}; }
+    TASK_TIMEOUT_MIN=45          # hard wall-clock cap on the main claude -p call
+    PROJECT_LOCK_WAIT_MIN=60     # how long a sibling waits for the project lock
+    [ -f "$CONFIG" ] && {
+        source "$CONFIG"
+        MAX_RETRIES=${max_retries:-3}
+        TASK_TIMEOUT_MIN=${task_timeout_min:-45}
+        PROJECT_LOCK_WAIT_MIN=${project_lock_wait_min:-60}
+    }
     mkdir -p "$REVIEW_DIR"
+
+    # ── Per-project serialization ──────────────────────────────────────────────
+    # Tasks that share a ## Project mutate the same git working tree (and DB), so
+    # running them concurrently races — one task's half-written file breaks
+    # another's test run (the cause of repeated test-task retries). Hold an
+    # exclusive per-project lock for the whole run; a sibling waits instead of
+    # corrupting the tree. If the lock can't be taken within the wait window,
+    # requeue UNCHANGED (no retry burned) so a later pass retries once free.
+    PROJECT=$(awk '/^## Project/{found=1; next} found && /^[^#]/{print $1; exit} found && /^##/{exit}' "$TASK_FILE")
+    if [ -n "$PROJECT" ]; then
+        LOCK_DIR=~/tasks/.locks
+        mkdir -p "$LOCK_DIR"
+        exec 9>"$LOCK_DIR/${PROJECT}.lock"
+        if ! flock -w "$((PROJECT_LOCK_WAIT_MIN * 60))" 9; then
+            {
+                echo "## $(date '+%Y-%m-%d %H:%M') - $TASK_NAME"
+                echo ""
+                echo "**Status:** DEFERRED (project '$PROJECT' busy — lock wait timed out, not counted as retry)"
+                echo ""
+            } >> "$LOG"
+            mv "$TASK_FILE" "$INBOX/${TASK_NAME}.md"
+            exit 0
+        fi
+    fi
 
     {
         echo "# $TASK_NAME"
@@ -48,9 +79,10 @@ if [ "$1" = "--run" ]; then
     MODEL_FLAG=""
     RAW_MODEL=$(awk '/^## Model/{found=1; next} found && /^[^#]/{print; exit}' "$TASK_FILE" | tr -d '[:space:]')
     case "$RAW_MODEL" in
-        opus)   MODEL_FLAG="--model claude-opus-4-6" ;;
-        sonnet) MODEL_FLAG="--model claude-sonnet-4-6" ;;
+        opus)   MODEL_FLAG="--model claude-opus-4-8" ;;
+        sonnet) MODEL_FLAG="--model claude-sonnet-5" ;;
         haiku)  MODEL_FLAG="--model claude-haiku-4-5-20251001" ;;
+        fable)  MODEL_FLAG="--model claude-fable-5" ;;
         "")     MODEL_FLAG="" ;;
         *)      MODEL_FLAG="--model $RAW_MODEL" ;;
     esac
@@ -71,7 +103,12 @@ if [ "$1" = "--run" ]; then
     # stderr MUST go to a separate file: merging it into stdout (2>&1) prepends
     # warnings (e.g. the "workspace has not been trusted" notice) to the JSON and
     # breaks jq, which silently empties the report. Auth detection scans both.
-    claude --dangerously-skip-permissions $MODEL_FLAG -p "${WORKFLOW_PREFIX}${PREAMBLE}
+    # Hard wall-clock cap: `timeout` sends SIGTERM (exit 124) if the run overruns,
+    # so a parked/runaway task fails predictably here instead of waiting for an
+    # arbitrary external killer. Exit 124 (no parseable result) is caught by the
+    # interrupted-run handler below and deferred without burning a retry.
+    timeout "$((TASK_TIMEOUT_MIN * 60))" \
+        claude --dangerously-skip-permissions $MODEL_FLAG -p "${WORKFLOW_PREFIX}${PREAMBLE}
 
 $(cat "$TASK_FILE")" --output-format json > "$JSON_TMP" 2>"$ERR_TMP"
     STATUS=$?
@@ -116,8 +153,13 @@ $(cat "$TASK_FILE")" --output-format json > "$JSON_TMP" 2>"$ERR_TMP"
     # and never left orphaned in run/. If the run exited non-zero but still
     # produced a result, fall through and let the evaluator judge it.
     if [ "$STATUS" -ne 0 ] && [ -z "$(jq -r '.result // empty' "$JSON_TMP" 2>/dev/null)" ]; then
+        if [ "$STATUS" -eq 124 ]; then
+            INTERRUPT_REASON="timed out after ${TASK_TIMEOUT_MIN}m"
+        else
+            INTERRUPT_REASON="interrupted (exit code $STATUS)"
+        fi
         {
-            echo "Deferred: run interrupted (exit code $STATUS, no output — retry not counted)."
+            echo "Deferred: run $INTERRUPT_REASON, no output — retry not counted."
             echo ""
             echo "---"
             echo ""
@@ -126,13 +168,13 @@ $(cat "$TASK_FILE")" --output-format json > "$JSON_TMP" 2>"$ERR_TMP"
         {
             echo "## $(date '+%Y-%m-%d %H:%M') - $TASK_NAME"
             echo ""
-            echo "**Status:** DEFERRED (run interrupted, exit code $STATUS — not counted as retry)"
+            echo "**Status:** DEFERRED (run $INTERRUPT_REASON — not counted as retry)"
             echo "**Result:** \`$RESULT_FILE\`"
             echo ""
         } >> "$LOG"
         mv "$TASK_FILE" "$INBOX/${TASK_NAME}.md"
         rm -f "$JSON_TMP" "$ERR_TMP" "$TOKEN_TMP"
-        notify-send -u critical "Claude: Task Interrupted" "$TASK_NAME${WORKFLOW_LABEL} was killed (exit $STATUS) — requeued, no retry burned."
+        notify-send -u critical "Claude: Task Interrupted" "$TASK_NAME${WORKFLOW_LABEL} $INTERRUPT_REASON — requeued, no retry burned."
         exit 0
     fi
 
@@ -217,6 +259,28 @@ $(cat "$TASK_FILE")" --output-format json > "$JSON_TMP" 2>"$ERR_TMP"
         mv "$TASK_FILE" "$INBOX/${TASK_NAME}.md"
         rm -f "$EVAL_OUTPUT"
         notify-send -u critical "Claude: Auth Failure" "$TASK_NAME${WORKFLOW_LABEL} ran but could not be evaluated (auth). Deferred for re-check."
+        exit 0
+    fi
+
+    # Exit 4 = a ## Test Command timed out. The task may well have succeeded; the
+    # suite was just too slow/hung to yield a verdict. Defer like an auth failure
+    # (requeue unchanged, no retry burned) but do NOT drop the cooldown marker —
+    # this is not an auth problem and must not pause the whole queue.
+    if [ $EVAL_STATUS -eq 4 ]; then
+        {
+            printf "\n---\n\n## Evaluator (inconclusive)\n\n"
+            cat "$EVAL_OUTPUT"
+        } >> "$RESULT_FILE"
+        {
+            echo "## $(date '+%Y-%m-%d %H:%M') - $TASK_NAME"
+            echo ""
+            echo "**Status:** DEFERRED (test command timed out — not counted as retry)"
+            echo "**Result:** \`$RESULT_FILE\`"
+            echo ""
+        } >> "$LOG"
+        mv "$TASK_FILE" "$INBOX/${TASK_NAME}.md"
+        rm -f "$EVAL_OUTPUT"
+        notify-send "Claude: Eval Timed Out" "$TASK_NAME${WORKFLOW_LABEL} verification timed out — requeued, no retry burned."
         exit 0
     fi
 
@@ -374,7 +438,26 @@ fi
 
 if [ -z "$TASK_FILE" ]; then
     if ls "$INBOX"/*.md 2>/dev/null | grep -q .; then
-        echo "All tasks in $INBOX are blocked by unmet dependencies."
+        # Every remaining task is blocked. Flag any whose dependency has landed in
+        # review/ (failed) — those are DEAD: they can never unblock on their own and
+        # will pile up silently. Surface them so the user can intervene.
+        BLOCKED_COUNT=$(ls "$INBOX"/*.md 2>/dev/null | wc -l)
+        DEAD=""
+        for f in "$INBOX"/*.md; do
+            [ -f "$f" ] || continue
+            d=$(awk '/^## Depends-on/{found=1; next} found && /^[^#]/{print $1; exit} found && /^##/{exit}' "$f")
+            d="${d%.md}"
+            [ -z "$d" ] && continue
+            if ls "$REVIEW_DIR"/*"${d}"*.md >/dev/null 2>&1; then
+                DEAD="${DEAD}\n  - $(basename "$f" .md) → dep '${d}' is in review/ (failed)"
+            fi
+        done
+        echo "All $BLOCKED_COUNT task(s) in $INBOX are blocked by unmet dependencies."
+        if [ -n "$DEAD" ]; then
+            echo -e "Dead dependency chains (dependency failed to review/):$DEAD"
+            notify-send -u critical "Claude: Tasks Permanently Blocked" \
+                "One or more inbox tasks depend on a task that failed to review/. They will never run until you intervene."
+        fi
     else
         echo "Usage: claude-task [task.md]"
         echo "No .md task file found in $INBOX"

@@ -2,3 +2,12 @@ email=
 max_retries=3
 # Minutes the launcher pauses after an auth failure before retrying (default 30).
 auth_cooldown_min=30
+# Hard wall-clock cap (minutes) on the main claude -p run per task. On overrun
+# the run is SIGTERM'd and the task is deferred (no retry burned). Default 45.
+task_timeout_min=45
+# How long (minutes) a task waits for its per-## Project lock before requeueing
+# so same-project tasks don't race on the shared git tree/DB. Default 60.
+project_lock_wait_min=60
+# Per-command timeout (minutes) for ## Test Command runs in claude-eval. A
+# timeout is inconclusive (defer, no retry, queue not paused). Default 20.
+test_timeout_min=20

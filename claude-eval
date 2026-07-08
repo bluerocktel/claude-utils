@@ -11,6 +11,9 @@
 #   3 = inconclusive: the evaluator call itself failed to authenticate
 #       (auth/environment failure, NOT a task-quality failure). Callers must
 #       not treat this as a FAIL or burn a retry on it.
+#   4 = inconclusive: a ## Test Command timed out (slow/hung suite, often
+#       concurrency-induced — NOT a task-quality failure and NOT auth). Callers
+#       must defer without burning a retry, but must NOT pause the queue.
 #
 # If OUTPUT_FILE is given, evaluator response is written there.
 # Otherwise it is printed to stdout.
@@ -40,6 +43,13 @@ if [ ! -f "$RESULT_FILE" ]; then
     exit 2
 fi
 
+# Config: TEST_TIMEOUT_MIN caps each ## Test Command so a slow/hung suite can't
+# stall the evaluator indefinitely (set test_timeout_min=N in config to override).
+SCRIPT_DIR="$(dirname "$(realpath "$0")")"
+CONFIG="$SCRIPT_DIR/config"
+TEST_TIMEOUT_MIN=20
+[ -f "$CONFIG" ] && { source "$CONFIG"; TEST_TIMEOUT_MIN=${test_timeout_min:-20}; }
+
 # ── Test Command ───────────────────────────────────────────────────────────
 # Run commands under ## Test Command before calling the LLM evaluator.
 # A non-zero exit from any command short-circuits to FAIL immediately.
@@ -53,8 +63,22 @@ if grep -q "^## Test Command" "$TASK_FILE"; then
     while IFS= read -r cmd; do
         [ -z "${cmd// }" ] && continue
         TEST_RAN=1
-        bash -c "$cmd" >> "$TEST_TMP" 2>&1
+        timeout "$((TEST_TIMEOUT_MIN * 60))" bash -c "$cmd" >> "$TEST_TMP" 2>&1
         CMD_EXIT=$?
+        # A timeout (124) is NOT a task-quality signal — the suite may pass but be
+        # slow (or hung by concurrency). Return inconclusive (3) so the caller
+        # defers instead of failing the task and burning a retry.
+        if [ $CMD_EXIT -eq 124 ]; then
+            TIMEOUT_MSG=$(printf '## Test Results\n\nCommand timed out after %sm (verdict inconclusive):\n```\n%s\n```\n\nPartial output:\n```\n%s\n```' \
+                "$TEST_TIMEOUT_MIN" "$cmd" "$(cat "$TEST_TMP")")
+            if [ -n "$OUTPUT_FILE" ]; then
+                printf '%s\n' "$TIMEOUT_MSG" > "$OUTPUT_FILE"
+            else
+                printf '%s\n' "$TIMEOUT_MSG"
+            fi
+            rm -f "$TEST_TMP"
+            exit 4
+        fi
         if [ $CMD_EXIT -ne 0 ]; then
             TEST_EXIT=$CMD_EXIT
             TEST_FAILED_CMD="$cmd"
@@ -87,15 +111,17 @@ fi
 MODEL_FLAG=""
 RAW_MODEL=$(awk '/^## Model/{found=1; next} found && /^[^#]/{print; exit}' "$TASK_FILE" | tr -d '[:space:]')
 case "$RAW_MODEL" in
-    opus)   MODEL_FLAG="--model claude-opus-4-6" ;;
-    sonnet) MODEL_FLAG="--model claude-sonnet-4-6" ;;
+    opus)   MODEL_FLAG="--model claude-opus-4-8" ;;
+    sonnet) MODEL_FLAG="--model claude-sonnet-5" ;;
     haiku)  MODEL_FLAG="--model claude-haiku-4-5-20251001" ;;
+    fable)  MODEL_FLAG="--model claude-fable-5" ;;
     "")     MODEL_FLAG="" ;;
     *)      MODEL_FLAG="--model $RAW_MODEL" ;;
 esac
 
 PROMPT_TMP=$(mktemp)
 JSON_TMP=$(mktemp)
+ERR_TMP=$(mktemp)
 
 {
     cat <<'PREAMBLE'
@@ -122,9 +148,13 @@ PREAMBLE
     cat "$RESULT_FILE"
 } > "$PROMPT_TMP"
 
+# stderr MUST stay out of the JSON: merging it (2>&1) prepends warnings such as
+# the "workspace has not been trusted" notice, which breaks jq and silently
+# empties the verdict — that empty verdict used to be mis-read as FAIL and burn
+# retries. Capture stderr separately; auth detection scans both streams.
 claude --dangerously-skip-permissions $MODEL_FLAG \
     -p "$(cat "$PROMPT_TMP")" \
-    --output-format json > "$JSON_TMP" 2>&1
+    --output-format json > "$JSON_TMP" 2>"$ERR_TMP"
 CLAUDE_STATUS=$?
 
 EVAL_TEXT=$(jq -r '.result // ""' "$JSON_TMP" 2>/dev/null)
@@ -135,14 +165,18 @@ else
     printf '%s\n' "$EVAL_TEXT"
 fi
 
-# If the evaluator itself could not authenticate, the verdict is meaningless.
-# Report inconclusive (3) so the caller defers instead of failing the task.
-if is_auth_failure "$JSON_TMP" || { [ -z "$EVAL_TEXT" ] && [ $CLAUDE_STATUS -ne 0 ]; }; then
-    rm -f "$PROMPT_TMP" "$JSON_TMP"
+# Inconclusive (3) cases — the verdict is meaningless, so the caller must defer
+# instead of failing the task or burning a retry:
+#   - the evaluator could not authenticate, or
+#   - we got no parseable verdict text at all (empty result). This last guard is
+#     what stops an unparseable/garbled evaluator output from masquerading as a
+#     genuine FAIL, which is exactly the bug that sent a passing task to review.
+if is_auth_failure "$JSON_TMP" || is_auth_failure "$ERR_TMP" || [ -z "$EVAL_TEXT" ]; then
+    rm -f "$PROMPT_TMP" "$JSON_TMP" "$ERR_TMP"
     exit 3
 fi
 
-rm -f "$PROMPT_TMP" "$JSON_TMP"
+rm -f "$PROMPT_TMP" "$JSON_TMP" "$ERR_TMP"
 
 if [ $CLAUDE_STATUS -ne 0 ]; then
     exit 1

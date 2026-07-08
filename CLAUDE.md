@@ -45,6 +45,27 @@ A non-zero exit from the main `claude -p` call with **no parseable `.result`** m
 - `claude-task` catches this right after the auth-failure check: the task is requeued to `inbox/` **unchanged** — no retry burned, never sent to the evaluator (a blank report reads as FAIL), never left orphaned in `run/`. If the run exits non-zero but *does* produce a `.result`, it falls through to normal evaluation.
 - The autonomous PREAMBLE explicitly forbids waiting on async events: tasks must run tests/commands **synchronously**, block on their output, and record anything unfinished in `## Summary` rather than parking. This removes the root cause.
 - Before this fix, exit 143 with an empty report could pass the evaluator and hit the final branch, which logged `FAILED (exit code 143)` and `exit`ed **without archiving the task file** — leaving orphans in `~/tasks/run/`. If you see stale files there, that's the signature.
+- The main call is now wrapped in `timeout $((task_timeout_min*60))` (config `task_timeout_min`, default 45), so an overrun fails deterministically as **exit 124** and flows through the same deferral path — no more relying on an arbitrary external killer.
+
+### Per-project serialization (the `.locks/` lock)
+
+`claude-tasks` launches every inbox task in parallel, and tasks that share a `## Project` mutate the **same git working tree and DB**. Running them concurrently races — one task's half-written file breaks another's test run (this was the cause of a test task retrying 4× in one batch).
+
+- In `--run` mode `claude-task` extracts `## Project` and holds an exclusive `flock` on `~/tasks/.locks/<project>.lock` for the whole run (including evaluation, since the eval's `## Test Command` hits the same tree). Same-project tasks serialize; different projects still run in parallel.
+- If the lock isn't acquired within `project_lock_wait_min` minutes (config, default 60), the task is requeued **unchanged** (no retry burned) for a later pass. Tasks with no `## Project` are never locked.
+
+### Verification & evaluator timeouts
+
+- `claude-eval` wraps each `## Test Command` in `timeout $((test_timeout_min*60))` (config, default 20). A timeout returns **exit 4** = inconclusive (slow/hung suite, often concurrency-induced — not a quality signal and not auth).
+- `claude-task` treats eval **exit 4** like a deferral: requeue unchanged, no retry burned, and — unlike auth **exit 3** — it does **not** drop `.auth-cooldown` or pause the queue. Keep 3 (auth) and 4 (test timeout) distinct: 3 pauses the queue, 4 does not.
+
+### Dead dependency chains
+
+A task blocked by a `## Depends-on` whose dependency landed in `review/` (i.e. failed) can never unblock on its own. When the no-arg path finds every inbox task blocked, `claude-task` scans for deps sitting in `review/` and fires a critical `notify-send` so they don't pile up silently.
+
+### Model aliases
+
+`## Model: opus|sonnet|haiku|fable` map to `claude-opus-4-8`, `claude-sonnet-5`, `claude-haiku-4-5-20251001`, `claude-fable-5` in both `claude-task` and `claude-eval`. **Keep the two files in sync** when models change — a task's run and its evaluation should use consistent tiers.
 
 ### Capturing `claude -p --output-format json` (never merge stderr)
 
