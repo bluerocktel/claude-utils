@@ -38,6 +38,29 @@ An auth/credentials failure (expired token, `API Error: 401`) means no work happ
 - The launcher pauses the unattended (no-arg / cron) path while `~/tasks/.auth-cooldown` is younger than `auth_cooldown_min` minutes (config, default 30). An explicit task argument bypasses the pause. The marker is cleared on the first successful (non-401) run and ages out on its own.
 - To resume immediately after re-authenticating: run a task manually, or `rm ~/tasks/.auth-cooldown`.
 
+### Killed / interrupted run (exit 143)
+
+A non-zero exit from the main `claude -p` call with **no parseable `.result`** means the run was interrupted, not that the task is bad. The classic cause is a headless task parking itself to wait on an event that never fires (a Monitor event, `ScheduleWakeup`, or a task-notification) — there is no event loop in `claude -p`, so it eventually gets `SIGTERM`'d (**exit 143**).
+
+- `claude-task` catches this right after the auth-failure check: the task is requeued to `inbox/` **unchanged** — no retry burned, never sent to the evaluator (a blank report reads as FAIL), never left orphaned in `run/`. If the run exits non-zero but *does* produce a `.result`, it falls through to normal evaluation.
+- The autonomous PREAMBLE explicitly forbids waiting on async events: tasks must run tests/commands **synchronously**, block on their output, and record anything unfinished in `## Summary` rather than parking. This removes the root cause.
+- Before this fix, exit 143 with an empty report could pass the evaluator and hit the final branch, which logged `FAILED (exit code 143)` and `exit`ed **without archiving the task file** — leaving orphans in `~/tasks/run/`. If you see stale files there, that's the signature.
+
+### Capturing `claude -p --output-format json` (never merge stderr)
+
+Every `claude -p ... --output-format json` capture MUST send stdout and stderr to
+**separate** files (`> "$JSON_TMP" 2>"$ERR_TMP"`), never `2>&1`. Claude prints
+warnings to stderr (e.g. `Ignoring N permissions.allow entries ... this workspace
+has not been trusted`); merged into stdout they prepend non-JSON text, `jq` fails
+to parse, and `.result` / `.modelUsage` come back empty. That silently produced
+blank task reports AND blank evaluator verdicts — and a blank verdict was being
+read as FAIL, sending a task that actually passed through 10 retries into
+`review/`. Detection helpers (`is_auth_failure`) scan **both** files. As defence
+in depth: if `.result` is empty but the capture is non-empty, `claude-task` falls
+back to dumping the raw stdout/stderr into the report (never a silent blank), and
+`claude-eval` returns inconclusive **3** (defer, no retry) on any empty verdict,
+not FAIL. Trust the workspace once interactively to stop the warning at source.
+
 ### Task size rule
 
 Both `claude-prep` and `claude-brief` enforce a size constraint in their preambles: a task touching more than 5 files or spanning more than 3 distinct logical phases must be split into smaller tasks connected with `## Depends-on`. This keeps each task within the model's effective context window (~40%) and prevents silent quality degradation from context compaction.

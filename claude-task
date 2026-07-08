@@ -42,7 +42,7 @@ if [ "$1" = "--run" ]; then
         echo ""
     } > "$RESULT_FILE"
 
-    PREAMBLE="AUTONOMOUS MODE: You have no user to interact with. Never ask questions, never present options, never wait for confirmation. Make decisions and implement immediately. Document choices in a ## Summary at the end. After the ## Summary, always add a ## Tools Used section listing: (1) Agents: any agents from ~/.claude/agents/ that were invoked (list by name, or 'none'); (2) Skills: any skills that were invoked (list by name, or 'none'). After ## Tools Used, add a ## Suggested Commit Message section containing a ready-to-use git commit message (subject line + optional body) that accurately describes all changes made. Do not run git commit yourself. CRITICAL: Never use git checkout, git restore, or git reset to undo a previous attempt's changes. Any untracked files or unstaged modifications you find in the working tree may be legitimate work from other concurrently-running tasks — do not delete or revert them. If you need to undo your own specific changes from a previous attempt, edit only the exact lines you added."
+    PREAMBLE="AUTONOMOUS MODE: You have no user to interact with. Never ask questions, never present options, never wait for confirmation. Make decisions and implement immediately. There is no event loop in this headless run: never wait on a Monitor event, a scheduled wakeup, a task notification, or any asynchronous callback — those never fire here and the run will simply be killed. If a step needs test results or command output, run it SYNCHRONOUSLY, block on it, and read its output before continuing; if something genuinely cannot complete in one pass, finish now and record what remains in the ## Summary instead of parking to wait. Document choices in a ## Summary at the end. After the ## Summary, always add a ## Tools Used section listing: (1) Agents: any agents from ~/.claude/agents/ that were invoked (list by name, or 'none'); (2) Skills: any skills that were invoked (list by name, or 'none'). After ## Tools Used, add a ## Suggested Commit Message section containing a ready-to-use git commit message (subject line + optional body) that accurately describes all changes made. Do not run git commit yourself. CRITICAL: Never use git checkout, git restore, or git reset to undo a previous attempt's changes. Any untracked files or unstaged modifications you find in the working tree may be legitimate work from other concurrently-running tasks — do not delete or revert them. If you need to undo your own specific changes from a previous attempt, edit only the exact lines you added."
 
     # Resolve optional model override from task frontmatter (## Model field)
     MODEL_FLAG=""
@@ -64,12 +64,16 @@ if [ "$1" = "--run" ]; then
     fi
 
     JSON_TMP=$(mktemp)
+    ERR_TMP=$(mktemp)
     TOKEN_TMP=$(mktemp)
 
-    # --output-format json captures usage stats; no live streaming to RESULT_FILE during execution
+    # --output-format json captures usage stats; no live streaming to RESULT_FILE during execution.
+    # stderr MUST go to a separate file: merging it into stdout (2>&1) prepends
+    # warnings (e.g. the "workspace has not been trusted" notice) to the JSON and
+    # breaks jq, which silently empties the report. Auth detection scans both.
     claude --dangerously-skip-permissions $MODEL_FLAG -p "${WORKFLOW_PREFIX}${PREAMBLE}
 
-$(cat "$TASK_FILE")" --output-format json > "$JSON_TMP" 2>&1
+$(cat "$TASK_FILE")" --output-format json > "$JSON_TMP" 2>"$ERR_TMP"
     STATUS=$?
 
     # ── Auth-failure circuit-breaker ─────────────────────────────────────────
@@ -77,7 +81,7 @@ $(cat "$TASK_FILE")" --output-format json > "$JSON_TMP" 2>&1
     # inbox UNCHANGED (no retry burned, not sent to review), drop a cooldown
     # marker so the launcher stops hammering, and bail out. The queue resumes
     # automatically once the user re-authenticates.
-    if is_auth_failure "$JSON_TMP"; then
+    if is_auth_failure "$JSON_TMP" || is_auth_failure "$ERR_TMP"; then
         {
             echo "Deferred: authentication failure (no work performed, retry not counted)."
             echo "$(jq -r '.result // ""' "$JSON_TMP" 2>/dev/null)"
@@ -95,7 +99,7 @@ $(cat "$TASK_FILE")" --output-format json > "$JSON_TMP" 2>&1
         } >> "$LOG"
         touch "$COOLDOWN"
         mv "$TASK_FILE" "$INBOX/${TASK_NAME}.md"
-        rm -f "$JSON_TMP" "$TOKEN_TMP"
+        rm -f "$JSON_TMP" "$ERR_TMP" "$TOKEN_TMP"
         notify-send -u critical "Claude: Auth Failure" "$TASK_NAME${WORKFLOW_LABEL} deferred — re-authenticate (e.g. /login). Queue paused for cooldown."
         exit 0
     fi
@@ -103,8 +107,58 @@ $(cat "$TASK_FILE")" --output-format json > "$JSON_TMP" 2>&1
     # Auth is working — clear any stale cooldown marker so the queue resumes.
     rm -f "$COOLDOWN"
 
-    # Write Claude's response text to the result file
-    jq -r '.result // ""' "$JSON_TMP" > "$TOKEN_TMP.result" 2>/dev/null
+    # ── Killed / interrupted run ─────────────────────────────────────────────
+    # A non-zero exit from `claude -p` with no parseable result means the run
+    # was interrupted (e.g. SIGTERM → exit 143 when a headless task parks itself
+    # waiting on an event that never fires). No verdict is possible, so — like an
+    # auth failure — requeue the task to the inbox UNCHANGED: no retry burned,
+    # never sent to the evaluator (which would read the empty report as FAIL),
+    # and never left orphaned in run/. If the run exited non-zero but still
+    # produced a result, fall through and let the evaluator judge it.
+    if [ "$STATUS" -ne 0 ] && [ -z "$(jq -r '.result // empty' "$JSON_TMP" 2>/dev/null)" ]; then
+        {
+            echo "Deferred: run interrupted (exit code $STATUS, no output — retry not counted)."
+            echo ""
+            echo "---"
+            echo ""
+            echo "**Deferred:** $(date '+%Y-%m-%d %H:%M') — requeued to inbox (killed/interrupted run)."
+        } >> "$RESULT_FILE"
+        {
+            echo "## $(date '+%Y-%m-%d %H:%M') - $TASK_NAME"
+            echo ""
+            echo "**Status:** DEFERRED (run interrupted, exit code $STATUS — not counted as retry)"
+            echo "**Result:** \`$RESULT_FILE\`"
+            echo ""
+        } >> "$LOG"
+        mv "$TASK_FILE" "$INBOX/${TASK_NAME}.md"
+        rm -f "$JSON_TMP" "$ERR_TMP" "$TOKEN_TMP"
+        notify-send -u critical "Claude: Task Interrupted" "$TASK_NAME${WORKFLOW_LABEL} was killed (exit $STATUS) — requeued, no retry burned."
+        exit 0
+    fi
+
+    # Write Claude's response text to the result file. If the JSON could not be
+    # parsed (empty .result despite a non-empty capture), fall back to the raw
+    # stdout + any stderr so the report is never silently blank — a parse glitch
+    # then degrades to "ugly but present" instead of an empty, misleading report.
+    RESULT_TEXT=$(jq -r '.result // empty' "$JSON_TMP" 2>/dev/null)
+    if [ -z "$RESULT_TEXT" ] && { [ -s "$JSON_TMP" ] || [ -s "$ERR_TMP" ]; }; then
+        {
+            echo "> [claude-task] WARNING: could not parse Claude JSON output (.result empty)."
+            echo "> Raw stdout and stderr captures follow."
+            echo ""
+            echo "_stdout:_"
+            echo '```'
+            cat "$JSON_TMP"
+            echo '```'
+            echo ""
+            echo "_stderr:_"
+            echo '```'
+            cat "$ERR_TMP"
+            echo '```'
+        } > "$TOKEN_TMP.result"
+    else
+        printf '%s\n' "$RESULT_TEXT" > "$TOKEN_TMP.result"
+    fi
 
     # Build token usage section
     {
@@ -134,7 +188,7 @@ $(cat "$TASK_FILE")" --output-format json > "$JSON_TMP" 2>&1
         cat "$TOKEN_TMP" >> "$RESULT_FILE"
     fi
 
-    rm -f "$JSON_TMP" "$TOKEN_TMP" "$TOKEN_TMP.result"
+    rm -f "$JSON_TMP" "$ERR_TMP" "$TOKEN_TMP" "$TOKEN_TMP.result"
 
     {
         echo ""
@@ -193,6 +247,7 @@ $(cat "$TASK_FILE")" --output-format json > "$JSON_TMP" 2>&1
             # a different approach before the next attempt sees the task.
             if [ "$NEW_RETRIES" -ge 2 ]; then
                 STRATEGY_TMP=$(mktemp)
+                STRATEGY_ERR=$(mktemp)
                 claude --dangerously-skip-permissions $MODEL_FLAG -p \
 "STRATEGY MODE: This task has failed evaluation $NEW_RETRIES times. Diagnose the recurring failure pattern and suggest a concrete alternative approach for the next attempt.
 
@@ -204,10 +259,10 @@ Rules:
 - Output only raw Markdown starting with exactly: ## Retry Strategy (Attempt $NEW_RETRIES)
 
 ---
-$(cat "$TASK_FILE")" --output-format json > "$STRATEGY_TMP" 2>&1
+$(cat "$TASK_FILE")" --output-format json > "$STRATEGY_TMP" 2>"$STRATEGY_ERR"
 
                 STRATEGY_TEXT=$(jq -r '.result // ""' "$STRATEGY_TMP" 2>/dev/null)
-                rm -f "$STRATEGY_TMP"
+                rm -f "$STRATEGY_TMP" "$STRATEGY_ERR"
                 if [ -n "$STRATEGY_TEXT" ]; then
                     printf '\n%s\n' "$STRATEGY_TEXT" >> "$TASK_FILE"
                 fi
@@ -276,7 +331,11 @@ fi
 # Returns 0 if the task has no dependency or its dependency is in done/
 dep_satisfied() {
     local dep
-    dep=$(awk '/^## Depends-on/{found=1; next} found && /^[^#]/{print; exit} found && /^##/{exit}' "$1" | tr -d '[:space:]')
+    # Take only the first token of the Depends-on line, so a trailing
+    # " (explanatory note)" is ignored. Then strip a trailing .md.
+    # The value should be a bare slug (no date prefix, no .md), but the
+    # leading "*_" in the glob below absorbs a date prefix if one slipped in.
+    dep=$(awk '/^## Depends-on/{found=1; next} found && /^[^#]/{print $1; exit} found && /^##/{exit}' "$1")
     [ -z "$dep" ] && return 0
     dep="${dep%.md}"
     ls "$DONE_DIR"/*_"${dep}".task.md 2>/dev/null | grep -q .
@@ -302,7 +361,7 @@ fi
 if [ -n "$1" ]; then
     TASK_FILE="$1"
     if ! dep_satisfied "$TASK_FILE"; then
-        DEP=$(awk '/^## Depends-on/{found=1; next} found && /^[^#]/{print; exit} found && /^##/{exit}' "$TASK_FILE" | tr -d '[:space:]')
+        DEP=$(awk '/^## Depends-on/{found=1; next} found && /^[^#]/{print $1; exit} found && /^##/{exit}' "$TASK_FILE")
         echo "Task blocked: depends on '${DEP%.md}' which is not yet in done/."
         exit 1
     fi
