@@ -9,6 +9,10 @@ INBOX=~/tasks/inbox
 RUN_DIR=~/tasks/run
 DONE_DIR=~/tasks/done
 REVIEW_DIR=~/tasks/review
+SUGGEST_DIR=~/tasks/suggestions          # machine-proposed follow-up task stubs (user reviews)
+BACKLOG_DIR=~/tasks/backlog
+BACKLOG_REVIEW_DIR=~/tasks/backlog-for-review
+PROJECTS_DIR=~/tasks/projects
 LOG=~/tasks/DONE.md
 COOLDOWN=~/tasks/.auth-cooldown   # marker dropped on an auth failure; pauses launches
 
@@ -17,6 +21,121 @@ COOLDOWN=~/tasks/.auth-cooldown   # marker dropped on an auth failure; pauses la
 # be counted as a task failure or burn a retry.
 is_auth_failure() {
     grep -qiE 'API Error: 401|Invalid authentication credentials|OAuth token (has )?expired|Failed to authenticate' "$1"
+}
+
+# True if a task with this slug already exists anywhere in the pipeline, so a
+# follow-up suggestion is never a duplicate of something already queued, in
+# review, or already completed. Matches a bare `<slug>.md` and a prefix-
+# separated `*_<slug>.md` (date-prefixed backlog/done files), but not a mere
+# substring, to avoid false positives.
+slug_exists() {
+    local slug="$1" d
+    for d in "$INBOX" "$SUGGEST_DIR" "$BACKLOG_DIR" "$BACKLOG_REVIEW_DIR"; do
+        [ -f "$d/${slug}.md" ] && return 0
+        ls "$d"/*_"${slug}".md >/dev/null 2>&1 && return 0
+    done
+    ls "$DONE_DIR"/*_"${slug}".task.md >/dev/null 2>&1 && return 0
+    return 1
+}
+
+# ── Follow-up task suggester ─────────────────────────────────────────────────
+# Called ONLY from the verified-success branch (run completed AND passed
+# evaluation), BEFORE the task file is archived to done/. Proposes follow-up
+# task stubs — same-project next steps and cross-project propagation driven by
+# the target project's ## Relationships section — into ~/tasks/suggestions/ for
+# the user to promote or discard. Read-only w.r.t. the working tree: it reads the
+# task and its result report (authored-scoped to THIS task), never a git diff,
+# which could include concurrent sibling-task changes. Sets SUGGEST_COUNT.
+# Relies on globals: PROJECT, TASK_FILE, TASK_NAME, RESULT_FILE, MODEL_FLAG,
+# SUGGEST_ENABLED, SUGGEST_MAX.
+generate_suggestions() {
+    SUGGEST_COUNT=0
+    [ "$SUGGEST_ENABLED" = "1" ] || return 0
+    [ -n "$PROJECT" ] || return 0        # no ## Project → no target attribution
+    mkdir -p "$SUGGEST_DIR"
+
+    local proj_file="$PROJECTS_DIR/${PROJECT}.md"
+    local relationships=""
+    [ -f "$proj_file" ] && relationships=$(awk '
+        /^## Relationships/{f=1; print; next}
+        f && /^## /{exit}
+        f{print}' "$proj_file")
+
+    local sug_tmp sug_err
+    sug_tmp=$(mktemp); sug_err=$(mktemp)
+    claude --dangerously-skip-permissions $MODEL_FLAG -p \
+"SUGGESTER MODE: A task just completed and passed evaluation in project '$PROJECT'. Propose follow-up task stubs the user may want to queue next.
+
+Rules:
+- Silence is the default. Only suggest work you would genuinely bet is worth doing. Zero suggestions is a correct and common answer.
+- Suggest AT MOST $SUGGEST_MAX stubs total, spanning same-project next steps and cross-project propagation combined.
+- Cross-project propagation is driven ONLY by the ## Relationships block below. 'mirror -> X' means a code task in X reflecting this change; 'content -> X' means a writing task in X. Never invent a target project that is not listed there.
+- Do NOT suggest anything the result report already implies is done, nor trivial/obvious cleanup.
+- Each stub must be concrete: a clear title, what to do, and acceptance criteria. Scope each to under ~5 files; split otherwise.
+
+Output ONLY the stubs, each fenced EXACTLY as below, with no preamble and no closing remark. If you have no worthwhile suggestions, output the single line: NONE
+
+===SUGGESTION===
+slug: <kebab-case-unique-slug>
+project: <target project alias>
+kind: <same-project|mirror|content>
+---
+# <Title>
+
+## Project
+<target project alias>
+
+## Origin
+Suggested after '$TASK_NAME' completed in '$PROJECT'.
+
+<body: what to do, plus acceptance criteria>
+===END===
+
+--- TARGET PROJECT ## Relationships (may be empty) ---
+${relationships:-（none declared — same-project follow-ups only）}
+
+--- ORIGINAL TASK ---
+$(cat "$TASK_FILE")
+
+--- RESULT REPORT (what was done) ---
+$(cat "$RESULT_FILE")" --output-format json > "$sug_tmp" 2>"$sug_err"
+
+    local sug_text
+    sug_text=$(jq -r '.result // ""' "$sug_tmp" 2>/dev/null)
+    rm -f "$sug_tmp" "$sug_err"
+
+    [ -z "$sug_text" ] && { echo "[suggester] empty response for $TASK_NAME"; return 0; }
+    if printf '%s' "$sug_text" | grep -qx 'NONE'; then
+        echo "[suggester] no follow-ups proposed for $TASK_NAME"
+        return 0
+    fi
+
+    # Split the fenced stubs into per-stub temp files.
+    local parse_dir; parse_dir=$(mktemp -d)
+    awk -v dir="$parse_dir" '
+        /^===SUGGESTION===/ { n++; cur=sprintf("%s/stub-%03d", dir, n); inblk=1; next }
+        /^===END===/ { inblk=0; next }
+        inblk { print > cur }
+    ' <<< "$sug_text"
+
+    local written=0 skipped=0 f slug
+    for f in "$parse_dir"/stub-*; do
+        [ -f "$f" ] || continue
+        if [ "$written" -ge "$SUGGEST_MAX" ]; then skipped=$((skipped+1)); continue; fi
+        slug=$(awk -F': *' '/^slug:/{print $2; exit}' "$f" | tr -cd '[:alnum:]-')
+        if [ -z "$slug" ]; then skipped=$((skipped+1)); continue; fi
+        if slug_exists "$slug"; then
+            echo "[suggester] skip '$slug' (already exists in pipeline)"
+            skipped=$((skipped+1)); continue
+        fi
+        # Body is everything after the first '---' separator line.
+        awk 'p{print} /^---$/{p=1}' "$f" > "$SUGGEST_DIR/${slug}.md"
+        echo "[suggester] wrote suggestion: $slug"
+        written=$((written+1))
+    done
+    rm -rf "$parse_dir"
+    SUGGEST_COUNT=$written
+    echo "[suggester] $TASK_NAME -> $written suggestion(s) written, $skipped skipped"
 }
 
 # ── Internal execution mode ────────────────────────────────────────────────
@@ -32,11 +151,15 @@ if [ "$1" = "--run" ]; then
     MAX_RETRIES=3
     TASK_TIMEOUT_MIN=45          # hard wall-clock cap on the main claude -p call
     PROJECT_LOCK_WAIT_MIN=60     # how long a sibling waits for the project lock
+    SUGGEST_ENABLED=1            # emit follow-up suggestions after a verified success
+    SUGGEST_MAX=3                # per-task cap on suggestions written
     [ -f "$CONFIG" ] && {
         source "$CONFIG"
         MAX_RETRIES=${max_retries:-3}
         TASK_TIMEOUT_MIN=${task_timeout_min:-45}
         PROJECT_LOCK_WAIT_MIN=${project_lock_wait_min:-60}
+        SUGGEST_ENABLED=${suggest_enabled:-1}
+        SUGGEST_MAX=${suggest_max:-3}
     }
     mkdir -p "$REVIEW_DIR"
 
@@ -383,8 +506,16 @@ $(cat "$TASK_FILE")" --output-format json > "$STRATEGY_TMP" 2>"$STRATEGY_ERR"
 
     # Archive original task file alongside its result
     if [ $STATUS -eq 0 ]; then
+        # Verified success: propose follow-up tasks BEFORE the task file moves to
+        # done/ (the suggester still needs to read it). Best-effort — never let a
+        # suggester hiccup block archival.
+        generate_suggestions || true
         mv "$TASK_FILE" "$DONE_DIR/${TIMESTAMP}_${TASK_NAME}.task.md"
-        notify-send "Claude: Task Done" "$TASK_NAME${WORKFLOW_LABEL} completed successfully."
+        if [ "${SUGGEST_COUNT:-0}" -gt 0 ]; then
+            notify-send "Claude: Task Done" "$TASK_NAME${WORKFLOW_LABEL} completed. ${SUGGEST_COUNT} follow-up suggestion(s) in ~/tasks/suggestions/."
+        else
+            notify-send "Claude: Task Done" "$TASK_NAME${WORKFLOW_LABEL} completed successfully."
+        fi
     else
         notify-send -u critical "Claude: Task Failed" "$TASK_NAME${WORKFLOW_LABEL} failed. See $RESULT_FILE"
     fi

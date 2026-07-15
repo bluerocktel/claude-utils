@@ -86,6 +86,18 @@ not FAIL. Trust the workspace once interactively to stop the warning at source.
 
 Both `claude-prep` and `claude-brief` enforce a size constraint in their preambles: a task touching more than 5 files or spanning more than 3 distinct logical phases must be split into smaller tasks connected with `## Depends-on`. This keeps each task within the model's effective context window (~40%) and prevents silent quality degradation from context compaction.
 
+### Follow-up suggester
+
+After a task completes **and passes evaluation**, `claude-task` calls `generate_suggestions` to propose follow-up task stubs into `~/tasks/suggestions/` (same-project next steps + cross-project propagation). Watch out for:
+
+- **Fires from exactly one place: the verified-success branch.** Every earlier exit (auth fail, interrupt/timeout, eval defer 3/4, retry, review) returns before it. Do not add a second call site — reaching that branch is the *only* proof the run succeeded and passed eval.
+- **Must run BEFORE the `done/` archive `mv`.** The suggester reads `$TASK_FILE`; moving it first would break the read. The call is guarded `|| true` so a suggester hiccup never blocks archival.
+- **Reads the result report, never a `git diff`.** Sibling tasks under `claude-tasks` mutate the same tree concurrently; the report (`## Summary` etc.) is scoped to *this* task, a diff is not.
+- **Cross-project targets come only from the origin project's `## Relationships` section** (`~/tasks/projects/<PROJECT>.md`), format `verb → target: why`, verbs `mirror` (code task) / `content` (writing task). The suggester is told never to invent a target not listed there. `$PROJECT` is already captured at the top of `--run`; no project → no suggestions.
+- **Model-alias sync:** the suggester reuses `$MODEL_FLAG`, so it tracks the task's `## Model` automatically — nothing extra to keep in sync with `claude-eval`.
+- **Noise control:** capped at `suggest_max` (config, default 3), deduped via `slug_exists` against `inbox/backlog/backlog-for-review/suggestions/done`, and the prompt makes silence the default. Disable with `suggest_enabled=0`.
+- **Not yet built (deliberate):** no TTL sweep of stale stubs, and dedup is slug-based only (near-duplicates are caught at the user's review step).
+
 ### Adding a script
 
 1. Write it in this directory with a `#!/bin/bash` shebang.

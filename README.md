@@ -11,6 +11,8 @@ backlog/ → claude-prep  → backlog-for-review/ → (you review) → inbox/ �
 
 Everything else runs on cron.
 
+When a task finishes and passes evaluation, `claude-task` can also propose follow-up tasks: same-project next steps and cross-project propagation (e.g. an admin feature that should be mirrored in another app, or turned into website content). These land in `~/tasks/suggestions/` for you to promote into the flow or discard. See [Follow-up suggestions](#follow-up-suggestions).
+
 > **Note:** `claude-task` uses `--dangerously-skip-permissions`, which allows Claude to run shell commands, edit files, and use all tools without confirmation prompts. Only use this on Linux machines and tasks you trust.
 
 ## Requirements
@@ -117,7 +119,7 @@ claude-eval path/to/task.md path/to/result.md   # manual evaluation
 
 ### `claude-task`
 
-Runs a single task file autonomously in a detached tmux session. Picks the oldest `.md` from `~/tasks/inbox/` if no argument is given. Results are written to `~/tasks/done/` (timestamped) and logged to `~/tasks/DONE.md`. Sends a desktop notification on completion or failure.
+Runs a single task file autonomously in a detached tmux session. Picks the oldest `.md` from `~/tasks/inbox/` if no argument is given. Results are written to `~/tasks/done/` (timestamped) and logged to `~/tasks/DONE.md`. Sends a desktop notification on completion or failure. On a verified success it may also write follow-up task stubs to `~/tasks/suggestions/` (see [Follow-up suggestions](#follow-up-suggestions)).
 
 ```
 claude-task                  # picks oldest task from inbox
@@ -211,6 +213,7 @@ morning-briefing --print   # write report and also print to stdout
   run/                # tasks currently executing
   done/               # completed result files (timestamped)
   review/             # tasks that failed evaluation after max retries (need manual intervention)
+  suggestions/        # follow-up task stubs proposed after a verified success (promote or discard)
   DONE.md             # running log of all completed/failed/requeued tasks
   cron.log            # cron output (if using crontab automation)
 ```
@@ -272,11 +275,17 @@ code  # or: writing
 
 ## Local URL
 `https://myproject.test`
+
+## Relationships
+- mirror → otherapp: features built here should be reflected in otherapp
+- content → mysite: user-facing changes here may warrant website content
 ```
 
 The `## Type` field controls which conventions Claude applies:
 - `code`: coding rules apply (implementation plan, careful file editing, etc.)
 - `writing`: text rules apply (prose quality, no code conventions)
+
+The optional `## Relationships` field declares **outbound** propagation links used by the follow-up suggester. Each line is `verb → target: why`, where `verb` is `mirror` (propose a code task in the target) or `content` (propose a writing task in the target). Omit the section for projects with no downstream links (the common case). Links are one-directional by design: the suggester runs after work completes *here*, so it only needs this project's outbound targets, and there is nothing to keep in sync in the other project's file.
 
 ### Linking a task to a project
 
@@ -292,6 +301,24 @@ Your task here.
 ```
 
 Claude will read `~/tasks/projects/myproject.md` automatically before starting work.
+
+## Follow-up suggestions
+
+After a task completes **and passes evaluation**, `claude-task` runs a lightweight suggester pass that proposes follow-up task stubs into `~/tasks/suggestions/`:
+
+- **Same-project next steps** — a natural continuation of the work just finished.
+- **Cross-project propagation** — driven by the origin project's `## Relationships` section: a `mirror` link proposes a code task in the target app (e.g. an admin feature that also belongs in another app), a `content` link proposes a writing task (e.g. a website article or marketing post).
+
+Each stub is a ready-to-run task file (with its own `## Project` and an `## Origin` backlink). Review them like any other prepared task: move the good ones to `~/tasks/inbox/`, delete the rest. Nothing runs automatically from `suggestions/`.
+
+Behaviour and guardrails:
+
+- Fires only on a verified success — never from a failed, deferred, or interrupted run.
+- Requires the origin task to declare a `## Project`; tasks with no project are skipped.
+- Reads the task and its result report, never a `git diff` (which could include other concurrent tasks' changes).
+- Capped per task (`suggest_max`, default 3) and deduplicated against `inbox/`, `backlog/`, `backlog-for-review/`, `suggestions/`, and `done/` so the same work is never proposed twice.
+- Silence is the default — most tasks produce zero suggestions.
+- Disable entirely with `suggest_enabled=0` in `config`.
 
 ## Example
 
@@ -345,6 +372,17 @@ If your task file contains an `## Acceptance Criteria` section, `claude-eval` ru
 ```
 
 The retry limit defaults to 3 and can be changed by setting `max_retries=N` in your `config` file. Tasks that exhaust all retries are moved to `~/tasks/review/` and appear in `ltask` output for manual inspection.
+
+### Dynamic workflow execution
+
+Add a `## Workflow` section to run a task as a [Claude Code dynamic workflow](https://code.claude.com/docs/en/workflows) instead of a plain session. The workflow runtime fans the task out across multiple parallel subagents, which is faster for large-scope work like codebase audits, multi-file migrations, or research tasks that benefit from cross-checking.
+
+```markdown
+## Workflow
+yes
+```
+
+The presence of the `## Workflow` section is enough to enable it — the value is ignored. Requires Claude Code v2.1.154 or later. The eval/retry loop runs as normal after the workflow completes. Notifications show `(workflow)` so you can tell which mode ran.
 
 ### Task dependencies
 

@@ -11,3 +11,9 @@ project_lock_wait_min=60
 # Per-command timeout (minutes) for ## Test Command runs in claude-eval. A
 # timeout is inconclusive (defer, no retry, queue not paused). Default 20.
 test_timeout_min=20
+# After a task completes AND passes evaluation, propose follow-up task stubs
+# (same-project next steps + cross-project propagation) into ~/tasks/suggestions/
+# for you to review. Set to 0 to disable. Default 1.
+suggest_enabled=1
+# Per-task cap on how many follow-up suggestions are written. Default 3.
+suggest_max=3
