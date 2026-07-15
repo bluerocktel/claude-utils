@@ -14,21 +14,33 @@ That's not magic. It's a pipeline.
 
 The core idea is simple: treat Claude Code as a worker that picks tasks from a queue, not as a chatbot you interrogate.
 
+There are two ways to feed it work.
+
+**The brief path** (for anything non-trivial):
+
+```
+briefs/ → claude-brief → backlog-for-review/ → (you review) → inbox/ → claude-task → done/
+```
+
+**The standard path** (for single, well-understood tasks):
+
 ```
 backlog/ → claude-prep → backlog-for-review/ → (you review) → inbox/ → claude-task → done/
 ```
 
-Every step is automated. The only thing I do manually is review prepared tasks and decide whether to promote them to the execution queue.
+In both cases, the only thing I do manually is review prepared tasks and decide whether to promote them to the execution queue.
 
-**Step 1: draft.** I write rough ideas, sometimes a single sentence, and drop them in `~/tasks/backlog/`. When I have a lot on my mind, I dump everything into one file and let `claude-draft` split it into individual task files.
+**Step 1: describe.** I write a high-level description of a feature or investigation — loosely, in plain language — and drop it in `~/tasks/briefs/`. A single brief can describe work that spans multiple files, components, or even multiple execution steps. I don't think about structure at this point. That's the machine's job.
 
-**Step 2: prep.** `claude-prep` picks the oldest task, adds structure, acceptance criteria, and expected outcomes, and writes it to `~/tasks/backlog-for-review/`. I read the prepared task, adjust if needed, and promote it.
+**Step 2: decompose.** `claude-brief` picks up the file, reads the project context, explores the actual codebase with grep and glob to find exact file paths and line numbers, and decomposes the brief into N focused task files. Each task is scoped to fit within a single focused session. Tasks that depend on a prior task's output are automatically chained with a `## Depends-on` field. Every task keeps a `## Brief` pointer back to the original description so the executing agent always has the full intent available.
 
-**Step 3: execute.** `claude-task` picks the next task from `~/tasks/inbox/`, runs Claude Code headlessly in a detached tmux session with full tool access, writes the result to `~/tasks/done/`, and sends a desktop notification when it's done.
+**Step 3: prep** (standard path). For simpler, already-scoped work I still drop rough ideas into `~/tasks/backlog/` and let `claude-prep` add structure, acceptance criteria, and expected outcomes. If a task turns out to be too large, prep splits it automatically.
 
-**Step 4: evaluate.** After execution, `claude-eval` grades the result against the acceptance criteria. If anything fails, the task goes back to the queue with the evaluator's feedback appended. From the second failure onward, a strategist pass adds a `## Retry Strategy` section suggesting a concrete alternative approach. After three failed attempts, the task lands in `~/tasks/review/` for manual inspection.
+**Step 4: execute.** `claude-task` picks the next unblocked task from `~/tasks/inbox/`, runs Claude Code headlessly in a detached tmux session with full tool access, writes the result to `~/tasks/done/`, and sends a desktop notification when it's done. Blocked tasks — those whose `## Depends-on` dependency hasn't landed in `done/` yet — are skipped and picked up on the next pass.
 
-**Step 5: cron.** All of steps 1-3 run on a 15-minute cron. I drop something in backlog before lunch, and it's executed before I'm back.
+**Step 5: evaluate.** After execution, `claude-eval` grades the result against the acceptance criteria. If anything fails, the task goes back to the queue with the evaluator's feedback appended. From the second failure onward, a strategist pass adds a `## Retry Strategy` section suggesting a concrete alternative approach. After three failed attempts, the task lands in `~/tasks/review/` for manual inspection.
+
+**Step 6: cron.** All of steps 2-4 run on a 15-minute cron. I drop a brief before lunch, and a set of sequenced tasks are executing before I'm back.
 
 ---
 
@@ -36,9 +48,11 @@ Every step is automated. The only thing I do manually is review prepared tasks a
 
 The obvious win is time. Tasks that would take me 30-90 minutes of focused work now happen while I'm in a meeting or asleep.
 
-The less obvious win is parallelism. `claude-tasks` runs every task in `inbox/` simultaneously, each in its own tmux session. Last month I needed a full REST API built from scratch for a new product: authentication, resource endpoints, OpenAPI documentation, quiz delivery, content publication. Five tasks, five tmux sessions, running in parallel. Two hours later I had a working API with documentation.
+The less obvious win is parallelism with automatic sequencing. `claude-tasks` runs every unblocked task in `inbox/` simultaneously, each in its own tmux session. Tasks that produce output for the next step wait their turn automatically — no manual orchestration. Last month I needed a full REST API built from scratch for a new product: authentication, resource endpoints, OpenAPI documentation, quiz delivery, content publication. Five tasks, five tmux sessions, running in parallel. Two hours later I had a working API with documentation.
 
-The even less obvious win is quality enforcement. Because the eval loop grades every task against explicit criteria and feeds failure analysis back into retries, the output is more consistent than what you'd get from an ad-hoc session. The pipeline doesn't get tired. It doesn't skip the tests because it's 11pm.
+The even less obvious win is decomposition quality. When I write a brief, Claude explores the actual codebase before producing a single task file. The result is tasks that reference real line numbers, real class names, real file paths — not guesses. A task that says "update `Telecom0516Service.php` line 65" is not the same as one that says "find and update the billing service." The former executes reliably. The latter is a lottery.
+
+The quality enforcement compounds through the eval loop: every task is graded against explicit criteria, and failure analysis feeds back into retries. The pipeline doesn't get tired. It doesn't skip the tests because it's 11pm.
 
 ---
 
@@ -46,7 +60,7 @@ The even less obvious win is quality enforcement. Because the eval loop grades e
 
 One thing that makes this work at scale: I never repeat project-specific context in task files.
 
-Each project has a single context file at `~/tasks/projects/{name}.md` that defines the working directory, local URL, tech stack notes, and anything else Claude needs to orient itself. Tasks just reference the project alias:
+Each project has a single context file at `~/tasks/projects/{name}.md` that defines the working directory, local URL, tech stack notes, and anything Claude needs to orient itself — including execution conventions like which Docker container to use for running commands. Tasks just reference the project alias:
 
 ```markdown
 ## Project
@@ -56,7 +70,7 @@ bluerocklms
 Add rate limiting to the public API endpoints...
 ```
 
-Claude reads the project file automatically before starting. The task itself stays focused on the what, not the where-and-how.
+Claude reads the project file automatically before starting. The task itself stays focused on the what, not the where-and-how. When a convention changes — a new container, a different test runner, a renamed command — I update it in one place and every future task inherits it.
 
 ---
 

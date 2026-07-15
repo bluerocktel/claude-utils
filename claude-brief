@@ -72,7 +72,7 @@ CRITICAL RULES:
 - Multi-language projects: make locale updates explicit in Tasks and Acceptance Criteria for every affected task.
 - Tasks run fully autonomously: no questions, no options, no waiting for input."
 
-    claude --dangerously-skip-permissions -p "$PREAMBLE
+    claude --model claude-opus-4-8 --dangerously-skip-permissions -p "$PREAMBLE
 
 $(cat "$BRIEF_FILE")" > "$RESULT_FILE" 2>&1
     STATUS=$?

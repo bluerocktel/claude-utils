@@ -1,17 +1,24 @@
 # claude-utils
 
-Shell utilities for running and managing [Claude Code](https://claude.ai/code) tasks autonomously.
+Bash scripts that turn Claude Code into an autonomous task worker. Write a description, drop it in a folder, walk away. Claude structures the task, executes it headlessly, grades its own output, and retries if anything fails.
 
-Write a task as a Markdown file, drop it in `~/tasks/backlog/`, let Claude prepare it with acceptance criteria, review it, then execute it autonomously. Or write a high-level brief in `~/tasks/briefs/` and let Claude decompose it into multiple ready-to-run task files in one shot.
+The only step that requires you: a 2-minute review before a task runs.
 
-> **Note:** `claude-task` uses `--dangerously-skip-permissions`, which allows Claude to run shell commands, edit files, and use all tools without confirmation prompts. Only use this on machines and tasks you trust.
+```
+briefs/ → claude-brief → backlog-for-review/ → (you review) → inbox/ → claude-task → done/
+backlog/ → claude-prep  → backlog-for-review/ → (you review) → inbox/ → claude-task → done/
+```
+
+Everything else runs on cron.
+
+> **Note:** `claude-task` uses `--dangerously-skip-permissions`, which allows Claude to run shell commands, edit files, and use all tools without confirmation prompts. Only use this on Linux machines and tasks you trust.
 
 ## Requirements
 
 - [Claude Code](https://claude.ai/code) (`claude` CLI on `$PATH`)
 - `tmux`
-- `s-nail` (for `mtask` email sending)
 - `~/bin/` on your `$PATH`
+- `s-nail` — optional, only needed for `mtask` (email sending)
 
 ## Install
 
@@ -21,7 +28,7 @@ cd ~/Scripts/claude-utils
 cp config.example config
 # Edit config with your own values
 chmod +x ~/Scripts/claude-utils/*
-for script in claude-brief claude-briefs claude-draft claude-prep claude-preps claude-task claude-tasks claude-plan claude-plans claude-eval claude-review-alert ltask vtask mtask dtask; do
+for script in claude-brief claude-briefs claude-draft claude-prep claude-preps claude-task claude-tasks claude-eval claude-review-alert ltask vtask mtask dtask; do
   ln -s ~/Scripts/claude-utils/$script ~/bin/$script
 done
 ln -s ~/Scripts/claude-utils/init ~/bin/claude-init
@@ -40,7 +47,7 @@ claude-init
 
 ### `claude-init`
 
-Creates `~/tasks/{drafts,backlog,backlog-for-review,plan,plan-for-review,inbox,run,done,review}/` and drops a `sample-task.md` in backlog. Run once per machine.
+Creates `~/tasks/{briefs,drafts,backlog,backlog-for-review,inbox,run,done,review}/` and drops a `sample-task.md` in backlog. Run once per machine.
 
 ```
 claude-init
@@ -83,7 +90,7 @@ claude-draft path/to/draft.md  # process a specific file
 
 ### `claude-prep`
 
-Prepares a rough backlog task by adding structure and acceptance criteria. Picks the oldest `.md` from `~/tasks/backlog/` if no argument is given. Outputs a ready-to-review task file to `~/tasks/backlog-for-review/`. From there, move it to `~/tasks/inbox/` (simple tasks) or `~/tasks/plan/` (complex tasks needing a full implementation plan).
+Prepares a rough backlog task by adding structure and acceptance criteria. Picks the oldest `.md` from `~/tasks/backlog/` if no argument is given. Outputs a ready-to-review task file to `~/tasks/backlog-for-review/`. From there, review it and move it to `~/tasks/inbox/` to execute.
 
 ```
 claude-prep                  # picks oldest task from ~/tasks/backlog/
@@ -96,23 +103,6 @@ Launches preparation for all `.md` files in `~/tasks/backlog/` in parallel, each
 
 ```
 claude-preps
-```
-
-### `claude-plan`
-
-Generates an implementation plan for a task in `~/tasks/plan/`. Runs Claude in planning mode (no code written, no files edited) and writes a structured, ready-to-execute Markdown file to `~/tasks/plan-for-review/`. Review and edit the plan there, then move it to `~/tasks/inbox/` to execute with `claude-task`.
-
-```
-claude-plan                  # picks oldest task from ~/tasks/plan/
-claude-plan path/to/task.md  # plan a specific file
-```
-
-### `claude-plans`
-
-Launches planning for all `.md` files in `~/tasks/plan/` in parallel, each in its own tmux session.
-
-```
-claude-plans
 ```
 
 ### `claude-eval`
@@ -147,13 +137,13 @@ claude-tasks
 Dashboard view of the full task pipeline. Shows items needing your attention, pipeline stage counts, running tasks with elapsed time, today's stats, a per-project breakdown, and recent activity.
 
 ```
-dtask                # one-shot view
-while true; do clear; dtask; sleep 30; done    # live refresh every 30 seconds
+dtask      # one-shot view
+dtask -w   # live refresh every 30 seconds
 ```
 
 ### `ltask`
 
-Lists tasks across all stages: backlog, backlog-for-review, plan, plan-for-review, inbox, run, and review.
+Lists tasks across all stages: backlog, backlog-for-review, inbox, run, and review.
 
 ```
 ltask
@@ -217,8 +207,6 @@ morning-briefing --print   # write report and also print to stdout
   drafts/             # brain dumps for claude-draft to split into backlog tasks
   backlog/            # rough task ideas, brief descriptions
   backlog-for-review/ # Claude-prepared tasks with acceptance criteria (review before promoting)
-  plan/               # tasks needing a full implementation plan
-  plan-for-review/    # Claude-generated plans awaiting review (move to inbox/ to execute)
   inbox/              # .md files ready to run
   run/                # tasks currently executing
   done/               # completed result files (timestamped)
@@ -241,16 +229,7 @@ morning-briefing --print   # write report and also print to stdout
 
 1. Write a brief idea and drop it in `~/tasks/backlog/`
 2. Run `claude-prep`: Claude adds structure, acceptance criteria, and outputs to `~/tasks/backlog-for-review/`
-3. Review the prepared task, then:
-   - **Simple task:** move to `~/tasks/inbox/` and run `claude-task`
-   - **Complex task:** move to `~/tasks/plan/` for a full implementation plan
-
-### Planning workflow (for complex tasks)
-
-1. Move a reviewed task from `backlog-for-review/` to `~/tasks/plan/`
-2. Run `claude-plan`: Claude generates a structured plan to `~/tasks/plan-for-review/`
-3. Review and optionally edit the plan
-4. Move it to `~/tasks/inbox/` and run `claude-task`
+3. Review the prepared task, move to `~/tasks/inbox/` and run `claude-task`
 
 ## Crontab automation
 
@@ -314,25 +293,28 @@ Your task here.
 
 Claude will read `~/tasks/projects/myproject.md` automatically before starting work.
 
-### Task folder layout (full)
+## Example
 
+A minimal task file:
+
+```markdown
+## Project
+myapp
+
+## Context
+The /api/users endpoint returns all users including soft-deleted ones.
+
+## Tasks
+1. In app/Http/Controllers/Api/UserController.php, add ->whereNull('deleted_at')
+   to the index() query builder chain.
+
+## Acceptance Criteria
+- GET /api/users does not return users where deleted_at is not null
+- Existing users without deleted_at are still returned
+- grep -n "whereNull" app/Http/Controllers/Api/UserController.php returns a result
 ```
-~/tasks/
-  projects/           # project context files (one per project)
-  briefs/             # high-level feature descriptions waiting to be decomposed
-  briefs/done/        # archived briefs after decomposition (referenced by ## Brief in tasks)
-  drafts/             # brain dumps for claude-draft to split into backlog tasks
-  backlog/            # rough task ideas, brief descriptions
-  backlog-for-review/ # Claude-prepared tasks with acceptance criteria
-  plan/               # tasks needing a full implementation plan
-  plan-for-review/    # Claude-generated plans awaiting review
-  inbox/              # .md files ready to run
-  run/                # tasks currently executing
-  done/               # completed result files (timestamped)
-  review/             # tasks that failed evaluation after max retries
-  DONE.md             # running log of all completed/failed/requeued tasks
-  cron.log            # cron output (if using crontab automation)
-```
+
+Drop this in `~/tasks/inbox/` and run `claude-task`. Claude edits the file, verifies the criteria, and writes the result to `~/tasks/done/`. If a criterion fails, the task is re-queued automatically with the evaluator's feedback appended.
 
 ## Task size rule
 

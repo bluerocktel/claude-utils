@@ -5,7 +5,7 @@ TASKS_DIR=~/tasks
 
 echo "Initializing $TASKS_DIR ..."
 
-mkdir -p "$TASKS_DIR/briefs" "$TASKS_DIR/backlog" "$TASKS_DIR/backlog-for-review" "$TASKS_DIR/inbox" "$TASKS_DIR/run" "$TASKS_DIR/done" "$TASKS_DIR/review" "$TASKS_DIR/plan" "$TASKS_DIR/plan-for-review" "$TASKS_DIR/drafts"
+mkdir -p "$TASKS_DIR/briefs" "$TASKS_DIR/backlog" "$TASKS_DIR/backlog-for-review" "$TASKS_DIR/inbox" "$TASKS_DIR/run" "$TASKS_DIR/done" "$TASKS_DIR/review" "$TASKS_DIR/drafts"
 
 SAMPLE="$TASKS_DIR/backlog/sample-task.md"
 if [ ! -f "$SAMPLE" ]; then
@@ -49,8 +49,6 @@ echo "  $TASKS_DIR/briefs/"
 echo "  $TASKS_DIR/drafts/"
 echo "  $TASKS_DIR/backlog/"
 echo "  $TASKS_DIR/backlog-for-review/"
-echo "  $TASKS_DIR/plan/"
-echo "  $TASKS_DIR/plan-for-review/"
 echo "  $TASKS_DIR/inbox/"
 echo "  $TASKS_DIR/run/"
 echo "  $TASKS_DIR/done/"
