@@ -40,12 +40,15 @@ slug_exists() {
 
 # ── Follow-up task suggester ─────────────────────────────────────────────────
 # Called ONLY from the verified-success branch (run completed AND passed
-# evaluation), BEFORE the task file is archived to done/. Proposes follow-up
-# task stubs — same-project next steps and cross-project propagation driven by
-# the target project's ## Relationships section — into ~/tasks/suggestions/ for
-# the user to promote or discard. Read-only w.r.t. the working tree: it reads the
-# task and its result report (authored-scoped to THIS task), never a git diff,
-# which could include concurrent sibling-task changes. Sets SUGGEST_COUNT.
+# evaluation), BEFORE the task file is archived to done/. Proposes SAME-PROJECT
+# follow-up task stubs — a natural continuation of the work just finished — into
+# ~/tasks/suggestions/ for the user to promote or discard. This is a per-task
+# reflex with single-task tunnel vision; cross-project propagation and strategic
+# synthesis across the whole pipeline are now owned by the `planner` kind in
+# claude-scheduled (which reads recent done/, project roadmaps, the queues, and
+# review/ failures). Read-only w.r.t. the working tree: it reads the task and its
+# result report (author-scoped to THIS task), never a git diff, which could
+# include concurrent sibling-task changes. Sets SUGGEST_COUNT.
 # Relies on globals: PROJECT, TASK_FILE, TASK_NAME, RESULT_FILE, MODEL_FLAG,
 # SUGGEST_ENABLED, SUGGEST_MAX.
 generate_suggestions() {
@@ -54,22 +57,15 @@ generate_suggestions() {
     [ -n "$PROJECT" ] || return 0        # no ## Project → no target attribution
     mkdir -p "$SUGGEST_DIR"
 
-    local proj_file="$PROJECTS_DIR/${PROJECT}.md"
-    local relationships=""
-    [ -f "$proj_file" ] && relationships=$(awk '
-        /^## Relationships/{f=1; print; next}
-        f && /^## /{exit}
-        f{print}' "$proj_file")
-
     local sug_tmp sug_err
     sug_tmp=$(mktemp); sug_err=$(mktemp)
     claude --dangerously-skip-permissions $MODEL_FLAG -p \
-"SUGGESTER MODE: A task just completed and passed evaluation in project '$PROJECT'. Propose follow-up task stubs the user may want to queue next.
+"SUGGESTER MODE: A task just completed and passed evaluation in project '$PROJECT'. Propose SAME-PROJECT follow-up task stubs the user may want to queue next in this same project.
 
 Rules:
 - Silence is the default. Only suggest work you would genuinely bet is worth doing. Zero suggestions is a correct and common answer.
-- Suggest AT MOST $SUGGEST_MAX stubs total, spanning same-project next steps and cross-project propagation combined.
-- Cross-project propagation is driven ONLY by the ## Relationships block below. 'mirror -> X' means a code task in X reflecting this change; 'content -> X' means a writing task in X. Never invent a target project that is not listed there.
+- Suggest AT MOST $SUGGEST_MAX stubs, ALL in project '$PROJECT' — a natural continuation of the work just finished.
+- Do NOT propose cross-project work: mirroring this change into another app, or turning it into content elsewhere. Cross-project propagation and strategic multi-task synthesis are handled separately by the scheduled planner, not here.
 - Do NOT suggest anything the result report already implies is done, nor trivial/obvious cleanup.
 - Each stub must be concrete: a clear title, what to do, and acceptance criteria. Scope each to under ~5 files; split otherwise.
 
@@ -77,22 +73,19 @@ Output ONLY the stubs, each fenced EXACTLY as below, with no preamble and no clo
 
 ===SUGGESTION===
 slug: <kebab-case-unique-slug>
-project: <target project alias>
-kind: <same-project|mirror|content>
+project: $PROJECT
+kind: same-project
 ---
 # <Title>
 
 ## Project
-<target project alias>
+$PROJECT
 
 ## Origin
 Suggested after '$TASK_NAME' completed in '$PROJECT'.
 
 <body: what to do, plus acceptance criteria>
 ===END===
-
---- TARGET PROJECT ## Relationships (may be empty) ---
-${relationships:-（none declared — same-project follow-ups only）}
 
 --- ORIGINAL TASK ---
 $(cat "$TASK_FILE")

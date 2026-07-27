@@ -119,6 +119,7 @@ $(cat "$BRIEF_FILE")" > "$RESULT_FILE" 2>&1
     # Archive the brief to done/ — keeps .md so tasks can read it as context
     mkdir -p "$BRIEFS_DONE_DIR"
     mv "$BRIEF_FILE" "$BRIEF_ARCHIVE"
+    rm -f "$RESULT_FILE"
 
     notify-send "Claude: Brief Decomposed" "$BRIEF_NAME → $N_FILES task(s) in backlog-for-review/"
     exit 0

@@ -35,18 +35,18 @@ fi
 
 # ── Helpers ─────────────────────────────────────────────────────
 
-# Count regular files in a directory
+# Count .md task files in a directory
 _count() {
     local dir="$1"
     [ -d "$dir" ] || { echo 0; return; }
-    find "$dir" -maxdepth 1 -type f | wc -l
+    find "$dir" -maxdepth 1 -type f -name "*.md" | wc -l
 }
 
-# List basenames (strip .md) of files in a directory
+# List basenames (strip .md) of .md task files in a directory
 _list() {
     local dir="$1"
     [ -d "$dir" ] || return
-    find "$dir" -maxdepth 1 -type f -printf "%f\n" | sed 's/\.md$//' | sort
+    find "$dir" -maxdepth 1 -type f -name "*.md" -printf "%f\n" | sed 's/\.md$//' | sort
 }
 
 # Read ## Project field from a task file

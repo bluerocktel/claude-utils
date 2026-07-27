@@ -5,13 +5,18 @@ Bash scripts that turn Claude Code into an autonomous task worker. Write a descr
 The only step that requires you: a 2-minute review before a task runs.
 
 ```
-briefs/ → claude-brief → backlog-for-review/ → (you review) → inbox/ → claude-task → done/
-backlog/ → claude-prep  → backlog-for-review/ → (you review) → inbox/ → claude-task → done/
+briefs/  → claude-brief   → backlog-for-review/ → (you review) → inbox/ → claude-task → done/
+backlog/ → claude-prep    → backlog-for-review/ → (you review) → inbox/ → claude-task → done/
+scheduled/ → claude-scheduled → backlog-for-review/ or inbox/   (recurring jobs, fired by cron)
 ```
 
 Everything else runs on cron.
 
-When a task finishes and passes evaluation, `claude-task` can also propose follow-up tasks: same-project next steps and cross-project propagation (e.g. an admin feature that should be mirrored in another app, or turned into website content). These land in `~/tasks/suggestions/` for you to promote into the flow or discard. See [Follow-up suggestions](#follow-up-suggestions).
+The first two flows are **pull-based**: you (or a suggester) drop a file in `inbox/` and it runs. `claude-scheduled` is the **push side**: it generates work on a schedule (recurring tasks, market monitors, a weekly planner) so the pipeline feeds itself. See [`claude-scheduled`](#claude-scheduled).
+
+When a task finishes and passes evaluation, `claude-task` can also propose **same-project** follow-up tasks into `~/tasks/suggestions/` for you to promote or discard. Cross-project propagation and strategic multi-task planning now come from the `planner` kind in `claude-scheduled`, not this per-task reflex. See [Follow-up suggestions](#follow-up-suggestions).
+
+> **New:** the scheduled-job engine and the reflex/planner split are covered in [`new_features.md`](new_features.md) with a task-facing how-to.
 
 > **Note:** `claude-task` uses `--dangerously-skip-permissions`, which allows Claude to run shell commands, edit files, and use all tools without confirmation prompts. Only use this on Linux machines and tasks you trust.
 
@@ -30,7 +35,7 @@ cd ~/Scripts/claude-utils
 cp config.example config
 # Edit config with your own values
 chmod +x ~/Scripts/claude-utils/*
-for script in claude-brief claude-briefs claude-draft claude-prep claude-preps claude-task claude-tasks claude-eval claude-review-alert ltask vtask mtask dtask; do
+for script in claude-brief claude-briefs claude-draft claude-prep claude-preps claude-task claude-tasks claude-eval claude-review-alert claude-scheduled ltask vtask mtask dtask; do
   ln -s ~/Scripts/claude-utils/$script ~/bin/$script
 done
 ln -s ~/Scripts/claude-utils/init ~/bin/claude-init
@@ -199,6 +204,53 @@ morning-briefing --print   # write report and also print to stdout
 0 7 * * * $HOME/bin/morning-briefing >> $HOME/tasks/cron.log 2>&1
 ```
 
+### `claude-scheduled`
+
+The claude-utils pipeline is **pull-based**: work only happens when a file lands in `~/tasks/inbox/`. `claude-scheduled` is the push side — a cron-driven engine that turns recurring job definitions into pipeline work when they are *due*. Cron fires the script often (e.g. every 30 min); the script alone decides what actually runs, using **interval-since-last-run** bookkeeping rather than cron expressions. Safe to run against an empty or absent `~/tasks/scheduled/` folder (exits 0, quiet).
+
+Jobs live in `~/tasks/scheduled/*.md`, one file per job. Per-job last-run state is stamped in `~/tasks/scheduled/.state/<slug>.run`, where `<slug>` is the job filename without `.md`. See `examples/scheduled/` for a worked example.
+
+```
+claude-scheduled           # evaluate every job, dispatch the due ones
+```
+
+**Job file headers** (inline `## Field: value` form):
+
+- `## Kind` — `template`, `planner`, and `monitor` (all implemented).
+- `## Schedule` — see grammar below.
+- `## Project` — optional; carried into the rendered task and drives autonomy routing.
+- `## Model` — optional (`opus|sonnet|haiku|fable`); parsed for parity, unused by the `template` kind.
+
+**`## Schedule` grammar** (due-ness is interval-since-last-run):
+
+| Schedule       | Due when …                                                       |
+|----------------|------------------------------------------------------------------|
+| `daily`        | ~24h since the last run                                          |
+| `weekly`       | ~7d since the last run                                           |
+| `weekly-<dow>` | today is `<dow>` (mon/tue/wed/thu/fri/sat/sun) and not run today |
+| `monthly`      | the calendar month changed, or ~28d elapsed                      |
+| `every:<N>h`   | at least `N` hours (positive integer) since the last run        |
+
+A job with no/invalid `## Schedule` is skipped with a warning.
+
+**Autonomy routing (`template` kind).** By default a rendered task lands in `~/tasks/backlog-for-review/` (you review it before it runs). To opt a project into **pure automation** — rendering straight into `~/tasks/inbox/` — add a line `## Automation: auto` to `~/tasks/projects/<project>.md`. Routing only applies when the job declares a `## Project`.
+
+**`planner` kind (cross-project + strategic follow-ups).** A `planner` job is an agentic scheduled run that does what the per-task suggester structurally cannot: it synthesises across the whole pipeline. On a due run it reads the last ~15 completed tasks in `~/tasks/done/` (their `## Summary` sections), every project file's goals/roadmap and `## Relationships`, the current queues (`inbox/`, `backlog/`, `backlog-for-review/`, `suggestions/` — so it never re-proposes tracked work), and the failed tasks in `~/tasks/review/` (rethink candidates). It then proposes a **small RANKED set** (most valuable first) of next-task stubs — capped at `plan_ahead_max` (config, default 5) — into `~/tasks/suggestions/`, in the same `===SUGGESTION===` fenced format as the per-task suggester and deduplicated via the same slug check. Cross-project stubs respect each origin project's `## Relationships` verbs (`mirror` → code task, `content` → writing task) and never invent an unlisted target. The `claude -p` call is wrapped in `timeout $((scheduled_timeout_min*60))`; on an auth failure or timeout/empty result it defers **without** stamping state (so it retries), and it stamps state on any completed run including one that proposes nothing (`NONE`). If the job declares a `## Project`, that project's context is prioritised. See `examples/scheduled/weekly-planner.md`.
+
+**`monitor` kind (agentic watcher with snapshot diff).** A `monitor` job watches something that changes over time — competitor pricing, a docs page, a market signal. On a due run it runs **one** `claude -p` session that performs the watch described in the job body (web search / browsing, done synchronously) and compares its findings against the job's **saved snapshot** (`~/tasks/scheduled/.state/<slug>.snapshot.md`, absent on the first run). The response is machine-parseable: always a `===SNAPSHOT===` block (the current state, saved verbatim as the new snapshot) and a `===SIGNAL===` yes/no; on `yes` it also returns a `===REPORT===` block and — when the job declares a `## Project` — one `===SUGGESTION===` stub. Outcomes:
+
+- **Signal `yes`** — the report is written to `~/Notes/monitor-<slug>-YYYY-MM-DD.md`, and if the suggestion's slug is new (checked against the whole pipeline like the per-task suggester) a stub is written to `~/tasks/suggestions/<slug>.md`. A `notify-send` fires with the report path.
+- **Signal `no`** — the monitor is **SILENT**: no report, no stub, only the refreshed snapshot. This diff-against-last-run silence is the whole point — without it you'd drown in "nothing changed" notices.
+
+The `claude -p` call is wrapped in `timeout $((scheduled_timeout_min*60))` with separate stdout/stderr capture (`.result` parsed via `jq`). On an auth failure it drops the `~/tasks/.auth-cooldown` marker and defers **without** stamping state; on a timeout or empty result it defers **without** stamping. State is stamped only on a run that reached the snapshot write (signal yes OR no). See `examples/scheduled/market-monitor.md`.
+
+**Auth cooldown.** `template` jobs make no `claude` call, so they run even while `~/tasks/.auth-cooldown` is active. The agentic kinds (`planner` and `monitor`) skip while the cooldown is younger than `auth_cooldown_min` (config, default 30) and retry after it clears.
+
+**Suggested cron line** (do NOT install automatically — add it yourself):
+```
+*/30 * * * * $HOME/bin/claude-scheduled >> $HOME/tasks/cron.log 2>&1
+```
+
 ## Task folder layout
 
 ```
@@ -214,6 +266,8 @@ morning-briefing --print   # write report and also print to stdout
   done/               # completed result files (timestamped)
   review/             # tasks that failed evaluation after max retries (need manual intervention)
   suggestions/        # follow-up task stubs proposed after a verified success (promote or discard)
+  scheduled/          # recurring job definitions read by claude-scheduled (one .md per job)
+  scheduled/.state/   # per-job last-run stamps (<slug>.run) used to decide due-ness
   DONE.md             # running log of all completed/failed/requeued tasks
   cron.log            # cron output (if using crontab automation)
 ```
@@ -304,10 +358,10 @@ Claude will read `~/tasks/projects/myproject.md` automatically before starting w
 
 ## Follow-up suggestions
 
-After a task completes **and passes evaluation**, `claude-task` runs a lightweight suggester pass that proposes follow-up task stubs into `~/tasks/suggestions/`:
+Follow-up task stubs land in `~/tasks/suggestions/` from **two** sources:
 
-- **Same-project next steps** — a natural continuation of the work just finished.
-- **Cross-project propagation** — driven by the origin project's `## Relationships` section: a `mirror` link proposes a code task in the target app (e.g. an admin feature that also belongs in another app), a `content` link proposes a writing task (e.g. a website article or marketing post).
+- **The per-task reflex** (`claude-task`) — after a task completes **and passes evaluation**, a lightweight suggester pass proposes **same-project next steps only**: a natural continuation of the work just finished, in the same project. It has single-task tunnel vision by design.
+- **The scheduled planner** (`claude-scheduled`, `planner` kind) — owns everything the reflex cannot see: **cross-project propagation** (driven by each origin project's `## Relationships` section — a `mirror` link proposes a code task in the target app, a `content` link a writing task) and **strategic synthesis** across recent completed work, project roadmaps, the current backlog, and failed tasks. It emits a ranked set (see the `claude-scheduled` section).
 
 Each stub is a ready-to-run task file (with its own `## Project` and an `## Origin` backlink). Review them like any other prepared task: move the good ones to `~/tasks/inbox/`, delete the rest. Nothing runs automatically from `suggestions/`.
 

@@ -11,9 +11,17 @@ project_lock_wait_min=60
 # Per-command timeout (minutes) for ## Test Command runs in claude-eval. A
 # timeout is inconclusive (defer, no retry, queue not paused). Default 20.
 test_timeout_min=20
-# After a task completes AND passes evaluation, propose follow-up task stubs
-# (same-project next steps + cross-project propagation) into ~/tasks/suggestions/
-# for you to review. Set to 0 to disable. Default 1.
+# After a task completes AND passes evaluation, propose SAME-PROJECT follow-up
+# task stubs into ~/tasks/suggestions/ for you to review. Cross-project and
+# strategic follow-ups now come from the planner kind in claude-scheduled, not
+# this per-task reflex. Set to 0 to disable. Default 1.
 suggest_enabled=1
 # Per-task cap on how many follow-up suggestions are written. Default 3.
 suggest_max=3
+# Master switch for the scheduled-job engine (claude-scheduled). 0 disables. Default 1.
+scheduled_enabled=1
+# Wall-clock cap (minutes) for agentic scheduled jobs (monitor/planner). Default 30.
+scheduled_timeout_min=30
+# Per-run cap on how many ranked next-task stubs the planner kind writes to
+# ~/tasks/suggestions/. Default 5.
+plan_ahead_max=5

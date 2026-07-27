@@ -1,0 +1,570 @@
+#!/bin/bash
+# claude-scheduled: cron-driven driver that turns recurring job definitions in
+# ~/tasks/scheduled/ into pipeline work when they are *due*.
+#
+# The claude-utils pipeline is pull-based: work only happens when a file lands
+# in ~/tasks/inbox/. This engine is the push side — a single script that cron
+# fires often (e.g. every 30 min); the script alone decides what actually runs,
+# using interval-since-last-run bookkeeping (NOT cron expressions).
+#
+# Usage:
+#   claude-scheduled            Evaluate every ~/tasks/scheduled/*.md job and
+#                               dispatch the ones that are due. Safe to run on
+#                               an empty/absent folder (exit 0, quiet).
+#
+# Job file format (~/tasks/scheduled/<slug>.md):
+#   ## Kind: template | monitor | planner
+#   ## Schedule: daily | weekly | weekly-<dow> | monthly | every:<N>h
+#   ## Project: <name>        (optional)
+#   ## Model: opus|sonnet|…   (optional; unused by the template kind)
+#
+#   <Markdown body — becomes the rendered task body>
+#
+# Kinds:
+#   template  — deterministic recurring task, copied into the pipeline (this file)
+#   monitor   — agentic watcher: runs ONE claude -p that performs the watch,
+#               diffs against a saved snapshot, and on a real signal emits a
+#               dated report into ~/Notes/ AND a suggestion stub into
+#               ~/tasks/suggestions/; SILENT (snapshot only) when nothing changed
+#   planner   — agentic: synthesises across recent done/, project roadmaps, the
+#               current queues and review/ failures, and proposes a small RANKED
+#               set of next-task stubs into ~/tasks/suggestions/ (cross-project +
+#               strategic follow-ups; the per-task reflex owns same-project ones)
+
+# ── Directories ─────────────────────────────────────────────────────────────
+SCHEDULED_DIR=~/tasks/scheduled
+STATE_DIR=~/tasks/scheduled/.state         # per-job last-run stamps (<slug>.run)
+INBOX=~/tasks/inbox
+BACKLOG_DIR=~/tasks/backlog
+BACKLOG_REVIEW_DIR=~/tasks/backlog-for-review
+SUGGEST_DIR=~/tasks/suggestions            # machine-proposed follow-up task stubs (user reviews)
+DONE_DIR=~/tasks/done
+REVIEW_DIR=~/tasks/review                  # tasks that failed evaluation (planner rethink candidates)
+PROJECTS_DIR=~/tasks/projects
+COOLDOWN=~/tasks/.auth-cooldown            # auth-failure marker (see claude-task)
+
+# ── Config ──────────────────────────────────────────────────────────────────
+SCRIPT_DIR="$(dirname "$(realpath "$0")")"
+CONFIG="$SCRIPT_DIR/config"
+SCHEDULED_ENABLED=1
+AUTH_COOLDOWN_MIN=30
+SCHEDULED_TIMEOUT_MIN=30                    # wall-clock cap for agentic kinds (B/C)
+PLAN_AHEAD_MAX=5                            # cap on planner stubs per run
+if [ -f "$CONFIG" ]; then
+    source "$CONFIG"
+    SCHEDULED_ENABLED=${scheduled_enabled:-1}
+    AUTH_COOLDOWN_MIN=${auth_cooldown_min:-30}
+    SCHEDULED_TIMEOUT_MIN=${scheduled_timeout_min:-30}
+    PLAN_AHEAD_MAX=${plan_ahead_max:-5}
+fi
+
+log() { echo "claude-scheduled: $*"; }
+
+# ── Shared helpers (copied from claude-task:22-38, keep in sync) ──────────────
+# Defined here (guarded) so this file is self-contained for the agentic kinds.
+# The monitor and planner follow-up tasks both need these; the guard means
+# whichever task lands first defines them and the second reuses them — never a
+# double definition.
+if ! declare -F is_auth_failure >/dev/null 2>&1; then
+    # True if the file contains the signature of an auth/credentials failure
+    # (expired token, 401). Such a failure means no work was done — it must
+    # never be counted as a failure or stamp state (so the job retries later).
+    is_auth_failure() {
+        grep -qiE 'API Error: 401|Invalid authentication credentials|OAuth token (has )?expired|Failed to authenticate' "$1"
+    }
+fi
+
+if ! declare -F slug_exists >/dev/null 2>&1; then
+    # True if a task with this slug already exists anywhere in the pipeline, so a
+    # proposed stub is never a duplicate of something already queued, in review,
+    # or completed. Matches a bare `<slug>.md` and a prefix-separated
+    # `*_<slug>.md` (date-prefixed backlog/done files), but not a mere substring.
+    slug_exists() {
+        local slug="$1" d
+        for d in "$INBOX" "$SUGGEST_DIR" "$BACKLOG_DIR" "$BACKLOG_REVIEW_DIR"; do
+            [ -f "$d/${slug}.md" ] && return 0
+            ls "$d"/*_"${slug}".md >/dev/null 2>&1 && return 0
+        done
+        ls "$DONE_DIR"/*_"${slug}".task.md >/dev/null 2>&1 && return 0
+        return 1
+    }
+fi
+
+# Print the body of a fenced block from stdin: everything strictly between the
+# line equal to the start marker (e.g. ===SNAPSHOT===) and the first following
+# ===END=== line. Used by the monitor kind to split its machine-parseable
+# response (SNAPSHOT / SIGNAL / REPORT / SUGGESTION) into pieces.
+if ! declare -F extract_block >/dev/null 2>&1; then
+    extract_block() {
+        awk -v start="$1" '
+            $0==start { inblk=1; next }
+            inblk && /^===END===/ { exit }
+            inblk { print }
+        '
+    }
+fi
+
+# ── Master switch ───────────────────────────────────────────────────────────
+[ "$SCHEDULED_ENABLED" = "0" ] && exit 0
+
+# ── Field parsing ───────────────────────────────────────────────────────────
+# Jobs use the inline header form "## Field: value". A next-line form
+# ("## Field\nvalue", claude-task style) is accepted as a fallback for parity.
+get_field() {
+    local field="$1" file="$2" val
+    val=$(grep -m1 -iE "^##[[:space:]]+${field}[: ]" "$file" 2>/dev/null | head -n1)
+    if [ -n "$val" ]; then
+        val=$(printf '%s' "$val" | sed -E "s/^##[[:space:]]+${field}[:[:space:]]+//I")
+    else
+        # next-line form: "## Field" on its own line, value on the following line
+        val=$(awk -v f="$field" 'tolower($0)=="## " tolower(f){getline; if ($0 !~ /^#/) print; exit}' "$file")
+    fi
+    printf '%s' "$val" | tr -d '\r' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//'
+}
+
+# ── Due-ness ────────────────────────────────────────────────────────────────
+# is_due <slug> <schedule> → exit 0 due, 1 not due, 2 invalid/unknown schedule.
+# Interval-since-last-run only; date arithmetic, no external deps.
+is_due() {
+    local slug="$1" schedule="$2"
+    local statefile="$STATE_DIR/$slug.run"
+    local now last elapsed
+
+    # Validate the schedule grammar first, so an invalid schedule is rejected
+    # even for a never-run job (which would otherwise be treated as due).
+    case "$schedule" in
+        daily|weekly|weekly-mon|weekly-tue|weekly-wed|weekly-thu|weekly-fri|weekly-sat|weekly-sun|monthly) ;;
+        every:*h)
+            local nn="${schedule#every:}"; nn="${nn%h}"
+            case "$nn" in ''|*[!0-9]*) return 2 ;; esac
+            ;;
+        *) return 2 ;;
+    esac
+
+    now=$(date +%s)
+    [ -f "$statefile" ] && last=$(head -n1 "$statefile" 2>/dev/null | tr -dc '0-9')
+    [ -z "$last" ] && return 0                       # never run → due
+    elapsed=$(( now - last ))
+
+    case "$schedule" in
+        daily)
+            [ "$elapsed" -ge 82800 ] && return 0 || return 1        # ~23h (cron jitter margin)
+            ;;
+        weekly)
+            [ "$elapsed" -ge 601200 ] && return 0 || return 1       # ~6d23h
+            ;;
+        weekly-mon|weekly-tue|weekly-wed|weekly-thu|weekly-fri|weekly-sat|weekly-sun)
+            local target_u today_u last_date today_date
+            case "${schedule#weekly-}" in
+                mon) target_u=1 ;; tue) target_u=2 ;; wed) target_u=3 ;; thu) target_u=4 ;;
+                fri) target_u=5 ;; sat) target_u=6 ;; sun) target_u=7 ;;
+            esac
+            today_u=$(date +%u)                                     # 1=Mon … 7=Sun (locale-independent)
+            today_date=$(date +%Y-%m-%d)
+            last_date=$(date -d "@$last" +%Y-%m-%d 2>/dev/null)
+            # Due on the target weekday, at most once that day.
+            [ "$today_u" = "$target_u" ] && [ "$today_date" != "$last_date" ] && return 0
+            return 1
+            ;;
+        monthly)
+            local this_month last_month
+            this_month=$(date +%Y-%m)
+            last_month=$(date -d "@$last" +%Y-%m 2>/dev/null)
+            { [ "$this_month" != "$last_month" ] || [ "$elapsed" -ge 2419200 ]; } && return 0   # month changed or ~28d
+            return 1
+            ;;
+        every:*h)
+            local n="${schedule#every:}"; n="${n%h}"
+            case "$n" in ''|*[!0-9]*) return 2 ;; esac                # not a positive integer
+            [ "$elapsed" -ge $(( n * 3600 )) ] && return 0 || return 1
+            ;;
+        *)
+            return 2
+            ;;
+    esac
+}
+
+# ── Rendering ───────────────────────────────────────────────────────────────
+# Emit the job body into <out>, stripping the leading metadata header block and
+# prepending a next-line "## Project" header when the job declared a project (so
+# downstream per-project locking and the follow-up suggester keep working).
+render_task() {
+    local job="$1" project="$2" out="$3"
+    {
+        if [ -n "$project" ]; then
+            printf '## Project\n%s\n\n' "$project"
+        fi
+        awk '
+            BEGIN { inmeta = 1 }
+            inmeta && /^##[[:space:]]+(Kind|Schedule|Project|Model)([: ]|$)/ { next }
+            inmeta && /^[[:space:]]*$/ { next }
+            { inmeta = 0; print }
+        ' "$job"
+    } > "$out"
+}
+
+# ── Auth-cooldown gate ──────────────────────────────────────────────────────
+# Template jobs make no claude call, so they always run. Agentic kinds
+# (monitor/planner) must skip while a recent auth failure is cooling down.
+AUTH_COOLDOWN_ACTIVE=0
+if [ -f "$COOLDOWN" ] && find "$COOLDOWN" -mmin -"$AUTH_COOLDOWN_MIN" 2>/dev/null | grep -q .; then
+    AUTH_COOLDOWN_ACTIVE=1
+fi
+
+mkdir -p "$STATE_DIR"
+
+# ── Main loop ───────────────────────────────────────────────────────────────
+shopt -s nullglob
+jobs=("$SCHEDULED_DIR"/*.md)
+[ ${#jobs[@]} -eq 0 ] && exit 0            # no jobs → quiet exit
+
+for job in "${jobs[@]}"; do
+    slug=$(basename "$job" .md)
+    kind=$(get_field Kind "$job")
+    schedule=$(get_field Schedule "$job")
+    project=$(get_field Project "$job")
+    model=$(get_field Model "$job")        # parsed for parity; template kind ignores it
+
+    # Model-alias resolution (unused by template; kept here so B/C need no change).
+    MODEL_FLAG=""
+    case "$model" in
+        opus)   MODEL_FLAG="--model claude-opus-4-8" ;;
+        sonnet) MODEL_FLAG="--model claude-sonnet-5" ;;
+        haiku)  MODEL_FLAG="--model claude-haiku-4-5-20251001" ;;
+        fable)  MODEL_FLAG="--model claude-fable-5" ;;
+        "")     MODEL_FLAG="" ;;
+        *)      MODEL_FLAG="--model $model" ;;
+    esac
+
+    # Schedule validity + due-ness.
+    is_due "$slug" "$schedule"; rc=$?
+    if [ "$rc" -eq 2 ]; then
+        log "job '$slug': invalid or missing ## Schedule ('$schedule') — skipping"
+        continue
+    fi
+    [ "$rc" -eq 0 ] || continue            # not due → skip silently, no state write
+
+    # ── Dispatch on kind ────────────────────────────────────────────────────
+    case "$kind" in
+        template)
+            target="$BACKLOG_REVIEW_DIR"; route="backlog-for-review (review gate)"
+            if [ -n "$project" ]; then
+                projfile="$PROJECTS_DIR/$project.md"
+                if [ -f "$projfile" ] && grep -qiE '^##[[:space:]]+Automation:[[:space:]]*auto[[:space:]]*$' "$projfile"; then
+                    target="$INBOX"; route="inbox (## Automation: auto)"
+                fi
+            fi
+            mkdir -p "$target"
+            out="$target/$slug-$(date '+%Y-%m-%d_%H-%M').md"
+            render_task "$job" "$project" "$out"
+            log "job '$slug': rendered → $route: $out"
+            date +%s > "$STATE_DIR/$slug.run"       # stamp only on successful dispatch
+            ;;
+        monitor)
+            # Agentic watcher: run ONE claude -p session that performs the watch
+            # described in the job body, compares against the saved snapshot, and
+            # on a real signal emits BOTH a dated report into ~/Notes/ AND a
+            # follow-up suggestion stub into ~/tasks/suggestions/. When nothing
+            # meaningful changed the monitor is SILENT (no report, no stub) but
+            # still refreshes its snapshot — that diff-against-last-run silence is
+            # the whole point (no "nothing changed" noise).
+            if [ "$AUTH_COOLDOWN_ACTIVE" -eq 1 ]; then
+                log "job '$slug': kind 'monitor' skipped (auth cooldown active) — will retry after cooldown"
+                continue                            # no state write → retries after cooldown
+            fi
+
+            snapfile="$STATE_DIR/$slug.snapshot.md"
+            prev_snapshot="(none — this is the first run for this monitor)"
+            [ -f "$snapfile" ] && prev_snapshot=$(cat "$snapfile")
+
+            # Body of the job (the watch instructions), header block stripped.
+            mon_body=$(awk '
+                BEGIN { inmeta = 1 }
+                inmeta && /^##[[:space:]]+(Kind|Schedule|Project|Model)([: ]|$)/ { next }
+                inmeta && /^[[:space:]]*$/ { next }
+                { inmeta = 0; print }
+            ' "$job")
+
+            # Stub attribution: only emit a suggestion stub when the job declares
+            # a ## Project (matches generate_suggestions' project-scoped stubs).
+            if [ -n "$project" ]; then
+                stub_spec="If (and only if) signal is yes, ALSO output exactly one suggestion stub, fenced EXACTLY as below, for a follow-up task in project '$project'. Choose kind: 'same-project' for follow-up work in '$project', 'mirror' for a code change to propagate, or 'content' for writing work — as appropriate.
+
+===SUGGESTION===
+slug: <kebab-case-unique-slug>
+project: $project
+kind: <same-project|mirror|content>
+---
+# <Title>
+
+## Project
+$project
+
+## Origin
+Raised by the '$slug' monitor on a scheduled run (signal detected).
+
+<body: what to do, plus acceptance criteria>
+===END==="
+            else
+                stub_spec="This job declares no ## Project, so DO NOT output a ===SUGGESTION=== block under any circumstances — emit only the snapshot, signal, and (on a signal) the report."
+            fi
+
+            mon_tmp=$(mktemp); mon_err=$(mktemp)
+            timeout $((SCHEDULED_TIMEOUT_MIN * 60)) \
+                claude --dangerously-skip-permissions $MODEL_FLAG -p \
+"MONITOR MODE: You are an agentic watcher. Perform the watch described below, SYNCHRONOUSLY (use web search / browsing as needed and BLOCK on results). This runs headless in 'claude -p' with NO event loop — NEVER park on async events (Monitor, ScheduleWakeup, notifications, task-notifications); they will never fire and the run will simply be killed. Do all work in this single pass.
+
+Compare your findings against the PREVIOUS SNAPSHOT provided at the end. A 'signal' means something changed that is genuinely worth the user's attention (per the watch's own definition of a signal). Routine, unchanged, or cosmetic differences are NOT a signal — stay silent.
+
+Output ONLY the machine-parseable structure below, with no preamble and no closing remark:
+
+1. ALWAYS a snapshot block capturing the CURRENT state, to be saved verbatim as the new snapshot for next time:
+===SNAPSHOT===
+<current state — concise, factual, comparable across runs>
+===END===
+
+2. ALWAYS a signal block — the single word yes or no:
+===SIGNAL===
+<yes|no>
+===END===
+
+3. If signal is yes, a report block (Markdown body for a dated note in ~/Notes/):
+===REPORT===
+# <short title>
+
+<what changed vs the previous snapshot, why it matters, and any recommended action>
+===END===
+
+4. $stub_spec
+
+If signal is no: output the snapshot and signal blocks ONLY — no report, no suggestion.
+
+--- WATCH INSTRUCTIONS (from the job body) ---
+$mon_body
+
+--- PREVIOUS SNAPSHOT (what you reported last time) ---
+$prev_snapshot" --output-format json > "$mon_tmp" 2>"$mon_err"
+            mon_rc=$?
+
+            # ── Handle the outcome ───────────────────────────────────────────
+            if is_auth_failure "$mon_tmp" || is_auth_failure "$mon_err"; then
+                log "job '$slug': monitor hit an auth failure — deferring (no state write), dropping cooldown marker"
+                touch "$COOLDOWN"
+                rm -f "$mon_tmp" "$mon_err"
+                continue                            # no state stamp → retries after cooldown
+            fi
+
+            mon_text=$(jq -r '.result // ""' "$mon_tmp" 2>/dev/null)
+            rm -f "$mon_tmp" "$mon_err"
+
+            if [ "$mon_rc" -eq 124 ] || [ -z "$mon_text" ]; then
+                log "job '$slug': monitor timed out or returned empty (rc=$mon_rc) — inconclusive, deferring (no state write)"
+                continue                            # no state stamp → retries next run
+            fi
+
+            # Refresh the snapshot on every successful run (signal yes OR no).
+            snapshot=$(printf '%s' "$mon_text" | extract_block '===SNAPSHOT===')
+            if [ -n "$snapshot" ]; then
+                printf '%s\n' "$snapshot" > "$snapfile"
+            else
+                log "job '$slug': monitor returned no ===SNAPSHOT=== block — keeping previous snapshot"
+            fi
+
+            signal=$(printf '%s' "$mon_text" | extract_block '===SIGNAL===' | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+
+            if [ "$signal" = "yes" ]; then
+                report=$(printf '%s' "$mon_text" | extract_block '===REPORT===')
+                if [ -n "$report" ]; then
+                    mkdir -p ~/Notes
+                    report_path=~/Notes/monitor-"$slug"-"$(date '+%Y-%m-%d')".md
+                    printf '%s\n' "$report" > "$report_path"
+                    log "job '$slug': SIGNAL — wrote report → $report_path"
+                else
+                    report_path=""
+                    log "job '$slug': SIGNAL but no ===REPORT=== block returned"
+                fi
+
+                # Suggestion stub (only present when the job declared a project).
+                stub=$(printf '%s' "$mon_text" | extract_block '===SUGGESTION===')
+                if [ -n "$stub" ]; then
+                    mslug=$(printf '%s' "$stub" | awk -F': *' '/^slug:/{print $2; exit}' | tr -cd '[:alnum:]-')
+                    if [ -z "$mslug" ]; then
+                        log "job '$slug': suggestion stub had no slug — not written"
+                    elif slug_exists "$mslug"; then
+                        log "job '$slug': skip stub '$mslug' (already in pipeline)"
+                    else
+                        mkdir -p "$SUGGEST_DIR"
+                        # Body is everything after the first '---' separator line.
+                        printf '%s\n' "$stub" | awk 'p{print} /^---$/{p=1}' > "$SUGGEST_DIR/${mslug}.md"
+                        log "job '$slug': wrote suggestion → $mslug"
+                    fi
+                fi
+
+                [ -n "$report_path" ] && command -v notify-send >/dev/null 2>&1 && \
+                    notify-send "Claude: Monitor signal" "$slug: $report_path"
+            else
+                log "job '$slug': no signal — snapshot refreshed, nothing else written"
+            fi
+
+            date +%s > "$STATE_DIR/$slug.run"       # reached snapshot write → stamp state
+            continue
+            ;;
+        planner)
+            # Agentic cross-project planner: read pipeline state (recent done/,
+            # project roadmaps, current queues, review/ failures) and propose a
+            # small RANKED set of next-task stubs into ~/tasks/suggestions/.
+            if [ "$AUTH_COOLDOWN_ACTIVE" -eq 1 ]; then
+                log "job '$slug': kind 'planner' skipped (auth cooldown active) — will retry after cooldown"
+                continue                            # no state write → retries after cooldown
+            fi
+
+            # ── Gather context (read-only, bounded to keep the prompt sane) ──
+            # Recent done: last ~15 result files by mtime, filename + ## Summary.
+            done_ctx=""
+            while IFS= read -r df; do
+                [ -f "$df" ] || continue
+                summ=$(awk '/^## Summary/{f=1;print;next} f&&/^## /{exit} f{print}' "$df")
+                done_ctx+="### $(basename "$df")"$'\n'"${summ:-(no ## Summary section)}"$'\n\n'
+            done < <(ls -t "$DONE_DIR"/*.md 2>/dev/null | head -15)
+            [ -n "$done_ctx" ] || done_ctx="(none)"
+
+            # Project files: goals/roadmap + ## Relationships. Prioritise the
+            # job's ## Project when it declares one; otherwise consider all.
+            proj_ctx=""
+            if [ -n "$project" ] && [ -f "$PROJECTS_DIR/$project.md" ]; then
+                proj_ctx="### $project"$'\n'"$(cat "$PROJECTS_DIR/$project.md")"$'\n\n'
+            else
+                for pf in "$PROJECTS_DIR"/*.md; do
+                    [ -f "$pf" ] || continue
+                    proj_ctx+="### $(basename "$pf" .md)"$'\n'"$(cat "$pf")"$'\n\n'
+                done
+            fi
+            [ -n "$proj_ctx" ] || proj_ctx="(no project files)"
+
+            # Current queues: titles already tracked (never re-propose these).
+            queue_ctx=""
+            for qd in "$INBOX" "$BACKLOG_DIR" "$BACKLOG_REVIEW_DIR" "$SUGGEST_DIR"; do
+                for qf in "$qd"/*.md; do
+                    [ -f "$qf" ] || continue
+                    queue_ctx+="- $(basename "$qf")"$'\n'
+                done
+            done
+            [ -n "$queue_ctx" ] || queue_ctx="(queues empty)"
+
+            # Failures: tasks sitting in review/ (candidates for a rethink).
+            fail_ctx=""
+            for ff in "$REVIEW_DIR"/*.md; do
+                [ -f "$ff" ] || continue
+                fail_ctx+="- $(basename "$ff")"$'\n'
+            done
+            [ -n "$fail_ctx" ] || fail_ctx="(no failed tasks)"
+
+            # ── Build the planner prompt ─────────────────────────────────────
+            plan_tmp=$(mktemp); plan_err=$(mktemp)
+            timeout $((SCHEDULED_TIMEOUT_MIN * 60)) \
+                claude --dangerously-skip-permissions $MODEL_FLAG -p \
+"PLANNER MODE: You are a cross-project planner for an autonomous task pipeline. Synthesise across the pipeline state below and propose a SMALL RANKED set of the highest-value next tasks the user is NOT already tracking.
+
+Rules:
+- Silence is acceptable. The goal is a SMALL set of genuinely high-value work — quality over quantity. Propose AT MOST $PLAN_AHEAD_MAX stubs.
+- RANK your suggestions by value, most valuable FIRST.
+- NEVER re-propose anything already present in the current queues (inbox/backlog/backlog-for-review/suggestions) listed below — those are already tracked.
+- Prefer synthesis a per-task reflex cannot do: connect several recent done tasks, advance a project's roadmap/goals, unblock or rethink a failed task in review/, or propagate work across projects.
+- For a CROSS-PROJECT suggestion, respect the ORIGIN project's ## Relationships verbs only: 'mirror -> X' means a code task in X; 'content -> X' means a writing task in X. NEVER invent a target project not listed in that project's ## Relationships.
+- Each stub must be concrete: a clear title, what to do, and acceptance criteria. Scope each to under ~5 files; split otherwise.
+
+Output ONLY the stubs, each fenced EXACTLY as below, most valuable first, with no preamble and no closing remark. If nothing is worth proposing, output the single line: NONE
+
+===SUGGESTION===
+slug: <kebab-case-unique-slug>
+project: <target project alias>
+kind: <same-project|mirror|content>
+---
+# <Title>
+
+## Project
+<target project alias>
+
+## Origin
+Proposed by the '$slug' planner on a scheduled run.
+
+<body: what to do, plus acceptance criteria>
+===END===
+
+--- RECENT COMPLETED WORK (last ~15 by mtime, filename + ## Summary) ---
+$done_ctx
+--- PROJECT FILES (goals/roadmap + ## Relationships) ---
+$proj_ctx
+--- CURRENT QUEUES (already tracked — do NOT re-propose) ---
+$queue_ctx
+--- FAILED TASKS in review/ (rethink candidates) ---
+$fail_ctx" --output-format json > "$plan_tmp" 2>"$plan_err"
+            plan_rc=$?
+
+            # ── Handle the outcome ───────────────────────────────────────────
+            if is_auth_failure "$plan_tmp" || is_auth_failure "$plan_err"; then
+                log "job '$slug': planner hit an auth failure — deferring (no state write), dropping cooldown marker"
+                touch "$COOLDOWN"
+                rm -f "$plan_tmp" "$plan_err"
+                continue                            # no state stamp → retries after cooldown
+            fi
+
+            plan_text=$(jq -r '.result // ""' "$plan_tmp" 2>/dev/null)
+            rm -f "$plan_tmp" "$plan_err"
+
+            if [ "$plan_rc" -eq 124 ] || [ -z "$plan_text" ]; then
+                log "job '$slug': planner timed out or returned empty (rc=$plan_rc) — deferring (no state write)"
+                continue                            # no state stamp → retries next run
+            fi
+
+            if printf '%s' "$plan_text" | grep -qx 'NONE'; then
+                log "job '$slug': planner proposed nothing worth queueing"
+                date +%s > "$STATE_DIR/$slug.run"   # completed run → stamp state
+                continue
+            fi
+
+            # Split the fenced stubs into per-stub temp files (mirrors the
+            # per-task suggester's awk splitter in claude-task).
+            plan_parse=$(mktemp -d)
+            awk -v dir="$plan_parse" '
+                /^===SUGGESTION===/ { n++; cur=sprintf("%s/stub-%03d", dir, n); inblk=1; next }
+                /^===END===/ { inblk=0; next }
+                inblk { print > cur }
+            ' <<< "$plan_text"
+
+            mkdir -p "$SUGGEST_DIR"
+            plan_written=0 plan_skipped=0
+            for pstub in "$plan_parse"/stub-*; do
+                [ -f "$pstub" ] || continue
+                if [ "$plan_written" -ge "$PLAN_AHEAD_MAX" ]; then plan_skipped=$((plan_skipped+1)); continue; fi
+                pslug=$(awk -F': *' '/^slug:/{print $2; exit}' "$pstub" | tr -cd '[:alnum:]-')
+                if [ -z "$pslug" ]; then plan_skipped=$((plan_skipped+1)); continue; fi
+                if slug_exists "$pslug"; then
+                    log "job '$slug': skip stub '$pslug' (already in pipeline)"
+                    plan_skipped=$((plan_skipped+1)); continue
+                fi
+                # Body is everything after the first '---' separator line.
+                awk 'p{print} /^---$/{p=1}' "$pstub" > "$SUGGEST_DIR/${pslug}.md"
+                log "job '$slug': wrote suggestion → $pslug"
+                plan_written=$((plan_written+1))
+            done
+            rm -rf "$plan_parse"
+
+            log "job '$slug': planner wrote $plan_written suggestion(s), $plan_skipped skipped"
+            [ "$plan_written" -gt 0 ] && command -v notify-send >/dev/null 2>&1 && \
+                notify-send "Claude: Planner" "$plan_written ranked follow-up(s) in ~/tasks/suggestions/ (from '$slug')."
+            date +%s > "$STATE_DIR/$slug.run"       # completed run → stamp state
+            continue
+            ;;
+        "")
+            log "job '$slug': missing ## Kind — skipping"
+            continue
+            ;;
+        *)
+            log "job '$slug': unknown kind '$kind' — skipping"
+            continue
+            ;;
+    esac
+done
+
+exit 0

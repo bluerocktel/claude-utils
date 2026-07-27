@@ -60,7 +60,24 @@ if grep -q "^## Test Command" "$TASK_FILE"; then
     TEST_RAN=0
     TEST_FAILED_CMD=""
 
-    while IFS= read -r cmd; do
+    ACC=""
+    while IFS= read -r line; do
+        # Skip Markdown code-fence delimiter lines (``` or ~~~), which the awk
+        # below captures alongside the commands when the Test Command is written
+        # as a fenced block. A bare fence line is not a runnable command —
+        # feeding it to bash -c aborts with "unexpected EOF while looking for
+        # matching" and masquerades as a genuine test failure.
+        case "$line" in '```'*|'~~~'*) continue ;; esac
+        # Honour backslash line-continuation exactly as bash does: strip the
+        # trailing backslash, accumulate, and defer execution until the logical
+        # command is complete. Without this, a multi-line "cmd && \" Test Command
+        # runs each physical line separately and the dangling "\" fails.
+        if [ "${line%\\}" != "$line" ]; then
+            ACC="$ACC${line%\\}"
+            continue
+        fi
+        cmd="$ACC$line"
+        ACC=""
         [ -z "${cmd// }" ] && continue
         TEST_RAN=1
         timeout "$((TEST_TIMEOUT_MIN * 60))" bash -c "$cmd" >> "$TEST_TMP" 2>&1
@@ -85,6 +102,18 @@ if grep -q "^## Test Command" "$TASK_FILE"; then
             break
         fi
     done < <(awk '/^## Test Command/{found=1; next} found && /^## /{exit} found{print}' "$TASK_FILE")
+
+    # Flush a trailing unterminated continuation (a block whose last line ended
+    # with a "\"); normal blocks end without one, so this is just a safety net.
+    if [ $TEST_EXIT -eq 0 ] && [ -n "${ACC// }" ]; then
+        TEST_RAN=1
+        timeout "$((TEST_TIMEOUT_MIN * 60))" bash -c "$ACC" >> "$TEST_TMP" 2>&1
+        CMD_EXIT=$?
+        if [ $CMD_EXIT -ne 0 ]; then
+            TEST_EXIT=$CMD_EXIT
+            TEST_FAILED_CMD="$ACC"
+        fi
+    fi
 
     if [ $TEST_EXIT -ne 0 ]; then
         FAIL_MSG=$(printf '## Test Results\n\nCommand failed (exit %s):\n```\n%s\n```\n\nOutput:\n```\n%s\n```\n\nVERDICT: FAIL' \
